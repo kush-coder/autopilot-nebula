@@ -1,0 +1,6817 @@
+"""Provider-neutral model gateway for Nebula 3.
+
+The domain only depends on the types in this module.  Provider SDK objects are
+never exposed to orchestration, policy, storage, or the UI.  Credentials are
+resolved lazily from environment references and are deliberately excluded from
+model serialization and repr output.
+"""
+
+from __future__ import annotations
+
+from .diagnostics import record_caught_exception, record_diagnostic
+
+import asyncio
+import base64
+import binascii
+import ipaddress
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import uuid
+from abc import ABC, abstractmethod
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+)
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
+from enum import Enum
+from typing import Any, Literal
+from urllib.parse import quote, urlsplit
+
+import boto3  # type: ignore[import-untyped]
+from botocore.config import Config as BotocoreConfig  # type: ignore[import-untyped]
+from botocore.exceptions import (  # type: ignore[import-untyped]
+    ConnectTimeoutError as BotocoreConnectTimeoutError,
+    EndpointConnectionError as BotocoreEndpointConnectionError,
+)
+import httpx
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+
+from .domain import ProviderProfile
+from .inline_reasoning import (
+    Piece,
+    ReplySplitter,
+    split_reply,
+    template_opens_thinking,
+)
+from .model_catalog import (
+    ModelDescriptor,
+    ModelRouteDescriptor,
+    UpstreamProvider,
+    openrouter_model_routes,
+    openrouter_models,
+    openrouter_upstream_providers,
+    route_limits_verified,
+)
+from .model_pricing import provider_token_rates
+from .redaction import redact_text
+from .tool_markup import recover as _recover_tool_markup
+
+
+class ProviderError(RuntimeError):
+    """A normalized, secret-safe provider failure."""
+
+
+class ProviderCredentialLockedError(ProviderError):
+    """The provider secret exists behind an interactive host-vault lock."""
+
+    code = "provider_credential_locked"
+    _nebula_diagnostic_reason_code = "dependency_unavailable"
+    _nebula_diagnostic_operator_detail = (
+        "The selected provider credential is saved, but the operating-system "
+        "vault on the Nebula host is locked."
+    )
+    _nebula_diagnostic_impact = (
+        "The provider request did not start; saved conversations and local work "
+        "remain available."
+    )
+
+
+class ProviderContextLengthError(ProviderError):
+    """The provider explicitly rejected the request for exceeding context."""
+
+
+class ProviderOverloadedError(ProviderError):
+    """A transient upstream failure that the identical request can retry."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+class ProviderResponseError(ProviderError):
+    """The provider completed a request without the required response shape."""
+
+    status_code = 502
+
+
+class ProviderToolCallError(ProviderError):
+    """The model attempted a function call that could not be accepted.
+
+    Its arguments or identity were unreadable, or the upstream refused the
+    function it named. Either way the model reached for a tool, so a caller
+    that offered none can ask again for the answer instead of failing.
+    """
+
+
+class ProviderQuotaError(ProviderError):
+    """The account's quota or billing limit is spent; retrying cannot help."""
+
+
+_REFUSAL_PREFIX = "provider blocked the response: "
+
+
+class ProviderRefusalError(ProviderResponseError):
+    """The provider declined to produce the response.
+
+    A vendor refusal, safety or content filter, guardrail, or blocked prompt,
+    reported with HTTP 200. Asking again with the same context gets the same
+    answer, so it is reported to the operator rather than recovered.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"{_REFUSAL_PREFIX}{reason}")
+        self.reason = reason
+
+
+class ProviderMalformedToolCallError(ProviderError):
+    """The model attempted a tool call its vendor could not parse.
+
+    That is a sampling accident, not a decision that no tool is needed: the
+    identical request usually succeeds, so a caller that offered tools may
+    ask once more.
+    """
+
+
+class UnsupportedCapability(ProviderError):
+    """Raised before a request when a required capability is unavailable."""
+
+
+StreamErrorKind = Literal[
+    "refusal",
+    "context_length",
+    "quota",
+    "overloaded",
+    "tool_call",
+    "malformed_tool_call",
+    "response",
+]
+"""Which typed provider failure ended a stream."""
+
+# A subclass comes before its base: a refusal is also a response error.
+_STREAM_ERROR_TYPES: dict[StreamErrorKind, type[ProviderError]] = {
+    "refusal": ProviderRefusalError,
+    "context_length": ProviderContextLengthError,
+    "quota": ProviderQuotaError,
+    "overloaded": ProviderOverloadedError,
+    "tool_call": ProviderToolCallError,
+    "malformed_tool_call": ProviderMalformedToolCallError,
+    "response": ProviderResponseError,
+}
+
+
+class ProviderKind(str, Enum):
+    OPENAI_RESPONSES = "openai_responses"
+    OPENAI_COMPATIBLE = "openai_compatible"
+    ANTHROPIC = "anthropic"
+    GEMINI = "gemini"
+    BEDROCK = "bedrock"
+
+
+class ProviderFlavor(str, Enum):
+    """Product/runtime identity, independent of the wire protocol adapter."""
+
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    GEMINI = "gemini"
+    VERTEX = "vertex"
+    BEDROCK = "bedrock"
+    AZURE_OPENAI = "azure_openai"
+    MICROSOFT_FOUNDRY = "microsoft_foundry"
+    MISTRAL = "mistral"
+    COHERE = "cohere"
+    XAI = "xai"
+    DEEPSEEK = "deepseek"
+    GROQ = "groq"
+    TOGETHER = "together"
+    FIREWORKS = "fireworks"
+    OPENROUTER = "openrouter"
+    ORCAROUTER = "orcarouter"
+    LITELLM = "litellm"
+    OLLAMA = "ollama"
+    VLLM = "vllm"
+    LLAMA_CPP = "llama_cpp"
+    SGLANG = "sglang"
+    LM_STUDIO = "lm_studio"
+    HUGGINGFACE_ENDPOINT = "huggingface_endpoint"
+    NVIDIA_NIM = "nvidia_nim"
+    CUSTOM = "custom"
+
+
+class ToolChoice(str, Enum):
+    """Provider-neutral tool routing policy."""
+
+    AUTO = "auto"
+    REQUIRED = "required"
+    # The tools stay declared, so replayed calls to them read as valid
+    # history, but the model may not call one. A route with no such control
+    # (Bedrock Converse) is sent its automatic default instead.
+    NONE = "none"
+
+
+class ModelCapabilities(BaseModel):
+    streaming: bool = True
+    tools: bool = False
+    strict_tools: bool = False
+    parallel_tools: bool = False
+    structured_output: bool = False
+    vision: bool = False
+    documents: bool = False
+    audio: bool = False
+    embeddings: bool = False
+    reasoning_controls: bool = False
+    usage: bool = True
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+
+    def supports(self, required: Iterable[str]) -> bool:
+        return all(bool(getattr(self, name, False)) for name in required)
+
+
+class ProviderConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    id: str
+    kind: ProviderKind
+    flavor: ProviderFlavor = ProviderFlavor.CUSTOM
+    base_url: str
+    default_model: str | None = None
+    model_allowlist: list[str] = Field(default_factory=list)
+    api_key_env: str | None = None
+    api_key_value: SecretStr | None = Field(default=None, exclude=True)
+    credential_ref: str | None = Field(default=None, exclude=True)
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=120.0, gt=0, le=900)
+    local: bool = False
+    data_residency: str | None = None
+    data_retention: str | None = None
+    enabled: bool = True
+    capabilities: ModelCapabilities = Field(default_factory=ModelCapabilities)
+    options: dict[str, Any] = Field(default_factory=dict)
+    # Request parameters each exact model advertises (OpenRouter catalog).
+    model_parameters: dict[str, list[str]] = Field(default_factory=dict)
+    # Models the catalog marks as always reasoning (OpenRouter
+    # ``reasoning.mandatory``); they are never asked to skip it.
+    reasoning_mandatory_models: list[str] = Field(default_factory=list)
+    # Per-token prices each exact model's catalog entry publishes (OpenRouter
+    # ``pricing``: decimal strings by billing unit), for cost estimates.
+    model_prices: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("base_url must use http or https")
+        return value.rstrip("/")
+
+    @field_validator("api_key_env")
+    @classmethod
+    def valid_api_key_environment_name(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("api_key_env must be a valid environment variable name")
+        return value
+
+    @model_validator(mode="after")
+    def endpoint_respects_locality(self) -> "ProviderConfig":
+        parsed = urlsplit(self.base_url)
+        if not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError(
+                "provider endpoint must have a host and no URL credentials"
+            )
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                "provider endpoint cannot contain query parameters or fragments"
+            )
+        host = parsed.hostname.rstrip(".").lower()
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as caught_error:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_001",
+                "A handled providers operation raised an exception.",
+                caught_error,
+                stage="providers",
+            )
+            address = None
+        is_local_address = host == "localhost" or bool(
+            address
+            and (
+                address.is_loopback
+                or address.is_private
+                or address.is_link_local
+                or address.is_reserved
+            )
+        )
+        if is_local_address and not self.local:
+            raise ValueError(
+                "private/link-local provider endpoints must be explicitly labeled local"
+            )
+        if self.local and not is_local_address:
+            raise ValueError(
+                "local provider endpoints must use localhost or a private, "
+                "link-local, or reserved IP address"
+            )
+        if parsed.scheme == "http" and not is_local_address:
+            raise ValueError(
+                "unencrypted provider endpoints are allowed only on local/private addresses"
+            )
+        return self
+
+    def resolve_api_key(self) -> SecretStr | None:
+        if self.api_key_value is not None:
+            return self.api_key_value
+        if self.credential_ref:
+            raise ProviderError(
+                f"provider {self.id!r} credential reference is unavailable"
+            )
+        if not self.api_key_env:
+            return None
+        value = os.getenv(self.api_key_env)
+        if not value:
+            raise ProviderError(
+                f"provider {self.id!r} requires environment variable "
+                f"{self.api_key_env!r}"
+            )
+        return SecretStr(value)
+
+
+class ModelMessage(BaseModel):
+    role: str
+    content: str | list[dict[str, Any]]
+
+
+def _openai_responses_message(message: ModelMessage) -> dict[str, Any]:
+    if isinstance(message.content, str):
+        return message.model_dump()
+    content: list[dict[str, Any]] = []
+    for part in message.content:
+        if part.get("type") == "image":
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{part.get('media_type')};base64,{part.get('data')}",
+                }
+            )
+        elif part.get("type") == "text":
+            content.append({"type": "input_text", "text": str(part.get("text") or "")})
+    return {"role": message.role, "content": content}
+
+
+def _openai_chat_message(message: ModelMessage) -> dict[str, Any]:
+    if isinstance(message.content, str):
+        return message.model_dump()
+    content: list[dict[str, Any]] = []
+    for part in message.content:
+        if part.get("type") == "image":
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{part.get('media_type')};base64,{part.get('data')}"
+                    },
+                }
+            )
+        elif part.get("type") == "text":
+            content.append({"type": "text", "text": str(part.get("text") or "")})
+    return {"role": message.role, "content": content}
+
+
+def _anthropic_message(message: ModelMessage) -> dict[str, Any]:
+    if isinstance(message.content, str):
+        return message.model_dump()
+    content: list[dict[str, Any]] = []
+    for part in message.content:
+        if part.get("type") == "image":
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": part.get("media_type"),
+                        "data": part.get("data"),
+                    },
+                }
+            )
+        elif part.get("type") == "text":
+            content.append({"type": "text", "text": str(part.get("text") or "")})
+    return {"role": message.role, "content": content}
+
+
+def _gemini_parts(content: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"text": content}]
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if part.get("type") == "image":
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": part.get("media_type"),
+                        "data": part.get("data"),
+                    }
+                }
+            )
+        elif part.get("type") == "text":
+            parts.append({"text": str(part.get("text") or "")})
+    return parts
+
+
+_BEDROCK_IMAGE_FORMATS = {
+    "image/png": "png",
+    "image/jpeg": "jpeg",
+    "image/jpg": "jpeg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def _bedrock_content(content: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Converse content blocks. An image travels as an image block, never as text."""
+
+    if isinstance(content, str):
+        return [{"text": content}]
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        kind = part.get("type")
+        if kind == "text":
+            blocks.append({"text": str(part.get("text") or "")})
+            continue
+        if kind != "image":
+            raise ProviderError(f"Bedrock does not accept {kind or 'untyped'} parts")
+        media_type = str(part.get("media_type") or "").lower()
+        image_format = _BEDROCK_IMAGE_FORMATS.get(media_type)
+        if image_format is None:
+            raise ProviderError(
+                f"Bedrock does not accept {media_type or 'untyped'} images; "
+                "send png, jpeg, gif or webp"
+            )
+        try:
+            data = base64.b64decode(str(part.get("data") or ""), validate=True)
+        except (
+            binascii.Error,
+            ValueError,
+        ) as exc:  # diagnostic-expected: a malformed attachment is reported, not sent as text
+            raise ProviderError("image part is not valid base64") from exc
+        blocks.append({"image": {"format": image_format, "source": {"bytes": data}}})
+    return blocks
+
+
+class ToolDefinition(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    strict: bool = True
+
+    @field_validator("input_schema")
+    @classmethod
+    def object_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if value.get("type") != "object":
+            raise ValueError("tool input schema must have type=object")
+        return value
+
+
+# Opaque state a route needs back on later steps: thinking signatures and
+# encrypted reasoning. Bounded so one response cannot bloat a turn record; a
+# response over the bound is replayed without it, as before it was kept.
+_REASONING_STATE_MAX_BYTES = 256 * 1024
+_CALL_METADATA_MAX_BYTES = 32 * 1024
+
+
+def _bounded_replay_state(
+    value: dict[str, Any] | None, limit: int, *, field: str
+) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        size = len(json.dumps(value, ensure_ascii=False))
+    except (TypeError, ValueError) as exc:
+        record_caught_exception(
+            "providers",
+            "providers.replay_state.unserializable",
+            "Provider replay state could not be serialized; it is not kept.",
+            exc,
+            stage="providers",
+            metadata={"field": field},
+        )
+        return None
+    if size > limit:
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.replay_state.oversized",
+            "Provider replay state exceeded its bound; the step is replayed "
+            "without it.",
+            outcome="fallback",
+            stage="providers",
+            retryable=False,
+            metadata={"field": field, "bytes": size, "limit": limit},
+        )
+        return None
+    return value
+
+
+class ModelToolResult(BaseModel):
+    call_id: str
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] | str
+    is_error: bool = False
+    # Calls one routing response issued share a group, and a replay sends them
+    # back as the single assistant message that issued them. ``None`` (history
+    # recorded before groups were) replays the call as a message of its own.
+    response_group: str | None = None
+    # Assistant prose alongside this group's tool calls. Present only on its
+    # first result, so adapters replay it once with the issuing message.
+    response_text: str | None = Field(default=None, max_length=200_000)
+    # The issuing response's ``ModelResponse.reasoning_state``, on the first
+    # result of its group.
+    reasoning_state: dict[str, Any] | None = None
+    # The call's own ``ToolCall.provider_metadata``.
+    provider_metadata: dict[str, Any] | None = None
+    # Content the tool produced for the model to see, such as a browser
+    # screenshot, delivered with this result (``ModelMessage`` part format).
+    # Kept out of dumps: an image is not text to count or log.
+    attachments: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
+
+
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+"""Reasoning levels Nebula can ask for, lowest spend first past ``none``.
+
+A route advertises whether it takes the control at all; it does not advertise
+which levels it honours, so an adapter sends what it was asked for and the
+caller treats an unchanged response as the answer, not as a guarantee.
+"""
+
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
+
+
+class ModelRequest(BaseModel):
+    messages: list[ModelMessage]
+    model: str | None = None
+    instructions: str | None = None
+    tools: list[ToolDefinition] = Field(default_factory=list)
+    tool_results: list[ModelToolResult] = Field(default_factory=list)
+    tool_choice: ToolChoice = ToolChoice.AUTO
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    temperature: float | None = None
+    parallel_tool_calls: bool = False
+    response_schema: dict[str, Any] | None = None
+    # How much of the output budget a reasoning model may spend thinking.
+    # Provider-neutral: an adapter translates it, or ignores it where the
+    # route does not advertise the control. ``None`` leaves the model's own
+    # default alone, which is what an ordinary turn wants.
+    reasoning_effort: ReasoningEffort | None = None
+    reasoning_max_tokens: int | None = Field(default=None, gt=0)
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def required_choice_has_tools(self) -> "ModelRequest":
+        if self.tool_choice == ToolChoice.REQUIRED and not self.tools:
+            raise ValueError("tool_choice=required requires at least one tool")
+        return self
+
+
+_TOOL_CALL_NAME = r"^[a-z][a-z0-9_.-]{1,127}$"
+_TOOL_CALL_ID_MAX_LENGTH = 500
+INVALID_TOOL_CALL_NAME = "invalid_tool_call"
+"""The name a call carries when the name the provider sent is unusable."""
+
+
+class ToolCall(BaseModel):
+    id: str = Field(min_length=1, max_length=_TOOL_CALL_ID_MAX_LENGTH)
+    name: str = Field(pattern=_TOOL_CALL_NAME)
+    arguments: dict[str, Any]
+    # Why Core could not read the call the model made, for the model to read
+    # and correct. Its arguments are then empty: they never run, and the
+    # text the model sent stays in the protected diagnostic.
+    invalid_reason: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # Opaque per-call state the route must get back when the call is
+    # replayed: a Gemini ``thought_signature``, or the ``extra_content`` an
+    # OpenAI-compatible route attached to the call. Never shown or logged.
+    provider_metadata: dict[str, Any] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+
+    @field_validator("provider_metadata")
+    @classmethod
+    def _bounded_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _bounded_replay_state(
+            value, _CALL_METADATA_MAX_BYTES, field="tool_call.provider_metadata"
+        )
+
+
+class ModelUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    # The part of ``input_tokens`` the route served from its prompt cache,
+    # when it says; zero otherwise.
+    cached_input_tokens: int = 0
+    # The part of ``input_tokens`` the route wrote to its prompt cache, when
+    # it says (Claude routes bill it above the uncached rate); zero otherwise.
+    cache_creation_input_tokens: int = 0
+    # What the route billed for this response in USD, when it says
+    # (OpenRouter's ``usage.cost``, which prices the upstream endpoint that
+    # actually served it); ``None`` otherwise.
+    cost_usd: float | None = None
+
+
+def usage_cost_usd(config: ProviderConfig, model: str | None, usage: Any) -> float:
+    """USD cost of ``usage`` (a ``ModelUsage`` or ``ChatTokenUsage``).
+
+    What the route billed, when it reported that; otherwise an estimate from
+    the profile's configured rates or the model's catalog prices
+    (:func:`provider_token_rates`), with cache reads and writes billed at
+    their own rates instead of the full input rate.
+    """
+
+    billed = getattr(usage, "cost_usd", None)
+    if isinstance(billed, (int, float)) and not isinstance(billed, bool):
+        return float(billed)
+    exact = model or config.default_model
+    rates = provider_token_rates(
+        config.options, config.model_prices.get(exact) if exact else None
+    )
+    return rates.cost_usd(
+        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+        cached_input_tokens=int(getattr(usage, "cached_input_tokens", 0) or 0),
+        cache_creation_input_tokens=int(
+            getattr(usage, "cache_creation_input_tokens", 0) or 0
+        ),
+    )
+
+
+# The validation context key under which an adapter hands its request to the
+# response it builds (see ``_adapter_response``).
+_RESPONSE_REQUEST = "request"
+
+
+class ModelResponse(BaseModel):
+    provider_id: str
+    model: str
+    text: str = ""
+    reasoning: str = ""
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    usage: ModelUsage = Field(default_factory=ModelUsage)
+    finish_reason: str | None = None
+    provider_request_id: str | None = None
+    raw: dict[str, Any] | None = Field(default=None, exclude=True)
+    raw_body: bytes | None = Field(default=None, exclude=True, repr=False)
+    # What the route needs back when this response's calls are replayed:
+    # ``reasoning_content``/``reasoning`` text and raw ``reasoning_details``
+    # (OpenAI-compatible), Anthropic ``thinking_blocks``, Responses
+    # ``reasoning_items`` (encrypted reasoning and commentary messages, in
+    # output order). ``provider_id`` and ``model`` name the route that
+    # produced it; signatures are only valid for that route and model. It
+    # changes nothing that is displayed.
+    reasoning_state: dict[str, Any] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+
+    @field_validator("reasoning_state")
+    @classmethod
+    def _bounded_reasoning_state(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        return _bounded_replay_state(
+            value, _REASONING_STATE_MAX_BYTES, field="response.reasoning_state"
+        )
+
+    @model_validator(mode="after")
+    def _recover_serialized_tool_calls(self, info: ValidationInfo) -> "ModelResponse":
+        """Read tool calls a route serialized into ``text``.
+
+        A route that does not run the model's tool parser puts the model's
+        own tool markup in the Chat Completions ``content`` field: DeepSeek's
+        DSML, GLM's or Qwen's ``<tool_call>`` or DeepSeek's special tokens.
+        They are tool calls wherever they arrive, so Core reads them into
+        ``tool_calls`` and every caller treats them the same as a call the
+        route reported properly: the broker, the policy engine and approvals
+        all still apply. A frame Core cannot read completely is left in
+        ``text`` untouched, for the caller's quarantine to refuse.
+
+        The model writes the names it was shown, which are wire names for a
+        tool a vendor cannot name as Nebula does (``tool_output.search`` goes
+        out as ``tool_output_search``). An adapter builds its response with
+        :func:`_adapter_response`, so a recovered name decodes against the
+        request exactly as a structured call's does.
+        """
+
+        found = _recover_tool_markup(self.text)
+        if not found.recovered:
+            return self
+        context = info.context if isinstance(info.context, dict) else {}
+        request = context.get(_RESPONSE_REQUEST)
+        recovered: list[ToolCall] = []
+        for index, call in enumerate(found.calls):
+            try:
+                recovered.append(
+                    ToolCall(
+                        id=f"{call.markup}-{uuid.uuid4().hex[:24]}",
+                        name=(
+                            _decode_tool_name(request, call.name)
+                            if isinstance(request, ModelRequest)
+                            else call.name
+                        ),
+                        arguments=call.arguments,
+                    )
+                )
+            except ValueError as exc:
+                record_caught_exception(
+                    "providers",
+                    "providers.dsml.invalid_recovered_call",
+                    "A tool frame in assistant content parsed into a call the "
+                    "tool schema rejects.",
+                    exc,
+                    stage="providers",
+                    metadata={"call_index": index, "markup": call.markup},
+                )
+                # One unusable call makes the whole frame untrustworthy, so
+                # the text is left exactly as it arrived.
+                return self
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.dsml.recovered_tool_calls",
+            "A route serialized tool calls into assistant content; Core "
+            "recovered them instead of discarding the turn.",
+            outcome="fallback",
+            stage="providers",
+            retryable=False,
+            metadata={
+                "provider_id": self.provider_id,
+                "model": self.model,
+                "recovered_calls": len(recovered),
+                "unparsed_frames": found.unparsed_frames,
+                "markup": ",".join(sorted({call.markup for call in found.calls})),
+            },
+        )
+        # An after-validator has to settle the model in place; a copy is
+        # discarded when the model is built through ``__init__``.
+        self.text = found.text
+        self.tool_calls = [*self.tool_calls, *recovered]
+        return self
+
+
+class StreamEventType(str, Enum):
+    STARTED = "started"
+    TEXT_DELTA = "text_delta"
+    REASONING_DELTA = "reasoning_delta"
+    TOOL_CALL = "tool_call"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class ModelStreamEvent(BaseModel):
+    type: StreamEventType
+    delta: str | None = None
+    tool_call: ToolCall | None = None
+    response: ModelResponse | None = None
+    error: str | None = None
+    context_length_exceeded: bool = False
+    # A transient upstream failure the operator may simply retry, as opposed
+    # to a request defect or a chat-side error.
+    retryable: bool = False
+    # The model attempted a function call that was malformed or refused
+    # upstream. A request that offered no tools can recover the answer.
+    tool_call_rejected: bool = False
+    # The typed failure behind an ERROR event, so a consumer raises what
+    # ``complete()`` would have: a refusal with its reason, spent quota, an
+    # overflow. ``None`` for a failure the adapter did not classify.
+    error_kind: StreamErrorKind | None = None
+
+    @classmethod
+    def failure(cls, exc: BaseException) -> "ModelStreamEvent":
+        """The ERROR event that reports ``exc`` to a stream's consumer."""
+
+        return cls(
+            type=StreamEventType.ERROR,
+            error=str(exc),
+            # Chat recovers from an overflow (compact, then retry once) only
+            # when the event says so.
+            context_length_exceeded=isinstance(exc, ProviderContextLengthError),
+            # A transient upstream failure is the operator's to retry; chat
+            # reports it as a provider overload rather than a chat defect.
+            retryable=isinstance(exc, ProviderOverloadedError),
+            tool_call_rejected=isinstance(exc, ProviderToolCallError),
+            error_kind=next(
+                (
+                    kind
+                    for kind, error_type in _STREAM_ERROR_TYPES.items()
+                    if isinstance(exc, error_type)
+                ),
+                None,
+            ),
+        )
+
+    def provider_error(self) -> ProviderError | None:
+        """The typed provider error an ERROR event reports, if it names one."""
+
+        if self.type != StreamEventType.ERROR:
+            return None
+        message = self.error or "provider stream failed"
+        kind = self.error_kind
+        # An event that sets only the older flags still means these.
+        if kind is None and self.context_length_exceeded:
+            kind = "context_length"
+        elif kind is None and self.retryable:
+            kind = "overloaded"
+        if kind is None:
+            return None
+        if kind == "refusal":
+            return ProviderRefusalError(message.removeprefix(_REFUSAL_PREFIX))
+        return _STREAM_ERROR_TYPES[kind](message)
+
+
+class ProviderHealth(BaseModel):
+    provider_id: str
+    healthy: bool
+    models: list[str] = Field(default_factory=list)
+    model_descriptors: list[ModelDescriptor] = Field(default_factory=list)
+    # Discovered models outside the profile's model allowlist, offered for adding.
+    unlisted_models: list[str] = Field(default_factory=list)
+    unlisted_model_descriptors: list[ModelDescriptor] = Field(default_factory=list)
+    # OpenRouter's upstream provider directory, for the routing allowlist.
+    upstream_providers: list[UpstreamProvider] = Field(default_factory=list)
+    detail: str | None = None
+    credential_verified: bool | None = None
+    catalog_source: str | None = None
+    key_expires_at: str | None = None
+    key_limit_remaining: float | None = None
+    provider_revision: int | None = Field(default=None, ge=1)
+
+
+class ProviderCatalogEntry(BaseModel):
+    flavor: ProviderFlavor
+    adapter: ProviderKind
+    display_name: str
+    local: bool = False
+    default_base_url: str | None = None
+    suggested_key_env: str | None = None
+    support_tier: str = Field(pattern=r"^(native|standard|compatible|gateway)$")
+    notes: str = "Capabilities are enabled only after provider contract tests."
+
+
+class ProviderRouteRequest(BaseModel):
+    required_capabilities: list[str] = Field(default_factory=list)
+    local_only: bool = False
+    cloud_allowed: bool = True
+    residency: str | None = None
+    max_input_cost_per_million: float | None = Field(default=None, ge=0)
+    preferred_provider_ids: list[str] = Field(default_factory=list)
+
+
+# A base URL path that ends in its API version: ``/v1``, ``/v1beta``, Z.ai's
+# and BigModel's ``/api/paas/v4``, DeepSeek's ``/beta`` (LiteLLM's DeepSeek
+# base, which takes ``/chat/completions`` directly).
+_VERSIONED_BASE_PATH = re.compile(r"/(?:v\d+[a-z0-9]*|beta)$")
+
+
+class ModelProvider(ABC):
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.config = config
+        self._transport = transport
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self.config.capabilities
+
+    def require(self, request: ModelRequest) -> str:
+        if not self.config.enabled:
+            raise ProviderError(f"provider {self.config.id!r} is disabled")
+        model = request.model or self.config.default_model
+        if not model:
+            raise ProviderError(
+                f"provider {self.config.id!r} requires an explicit model"
+            )
+        if self.config.model_allowlist and model not in self.config.model_allowlist:
+            raise ProviderError(
+                f"model {model!r} is not allowed by provider {self.config.id!r}"
+            )
+        required: list[str] = []
+        if request.tools or request.tool_results:
+            required.append("tools")
+            if any(tool.strict for tool in request.tools):
+                required.append("strict_tools")
+        if request.response_schema:
+            required.append("structured_output")
+        if not self.capabilities.supports(required):
+            missing = [
+                name for name in required if not getattr(self.capabilities, name)
+            ]
+            raise UnsupportedCapability(
+                f"provider {self.config.id!r} does not support: {', '.join(missing)}"
+            )
+        return model
+
+    def _client(
+        self, headers: dict[str, str], *, timeout: httpx.Timeout | None = None
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self.config.base_url,
+            headers={**self.config.extra_headers, **headers},
+            timeout=self.config.timeout_seconds if timeout is None else timeout,
+            transport=self._transport,
+        )
+
+    def _path(self, path: str) -> str:
+        """Avoid duplicating `/v1` when users provide an SDK-style base URL.
+
+        A base that already ends in its API version (``/v1``, Z.ai's and
+        BigModel's ``/api/paas/v4``, DeepSeek's ``/beta``) takes the operation
+        path without a second version segment.
+        """
+
+        normalized = "/" + path.lstrip("/")
+        base_path = httpx.URL(self.config.base_url).path.rstrip("/")
+        if base_path.endswith("/v1beta") and normalized.startswith("/v1beta/"):
+            return normalized[7:]
+        if _VERSIONED_BASE_PATH.search(base_path) and normalized.startswith("/v1/"):
+            return normalized[3:]
+        return normalized
+
+    def _bearer_or_key_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        key = self.config.resolve_api_key()
+        if key:
+            header = str(self.config.options.get("api_key_header", "Authorization"))
+            scheme = str(self.config.options.get("api_key_scheme", "Bearer "))
+            headers[header] = f"{scheme}{key.get_secret_value()}"
+        return headers
+
+    async def _post(
+        self,
+        client: httpx.AsyncClient,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        operation: str,
+        inspect: Callable[[httpx.Response], ProviderError | None] | None = None,
+    ) -> httpx.Response:
+        """POST one provider request, retrying transient upstream failures."""
+
+        return await _send_with_retry(
+            self.config,
+            lambda: client.post(path, json=payload),
+            operation=operation,
+            inspect=inspect,
+        )
+
+    @abstractmethod
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        raise NotImplementedError
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        # Providers can override with native streaming.  This fallback still
+        # honors cancellation and produces the same event contract.
+        yield ModelStreamEvent(type=StreamEventType.STARTED)
+        try:
+            response = await self.complete(request)
+        except asyncio.CancelledError as caught_error:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_002",
+                "A handled providers operation raised an exception.",
+                caught_error,
+                stage="providers",
+            )
+            raise
+        except Exception as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_003",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            yield ModelStreamEvent.failure(exc)
+            return
+        if response.reasoning:
+            yield ModelStreamEvent(
+                type=StreamEventType.REASONING_DELTA, delta=response.reasoning
+            )
+        if response.text:
+            yield ModelStreamEvent(type=StreamEventType.TEXT_DELTA, delta=response.text)
+        for call in response.tool_calls:
+            yield ModelStreamEvent(type=StreamEventType.TOOL_CALL, tool_call=call)
+        yield ModelStreamEvent(type=StreamEventType.COMPLETED, response=response)
+
+    @abstractmethod
+    async def health(self) -> ProviderHealth:
+        raise NotImplementedError
+
+
+# Statuses that mean the upstream produced nothing, so replaying the identical
+# request cannot duplicate work.  Other 4xx answers are request defects that a
+# retry would only repeat.  529 is Anthropic's ``overloaded_error``.
+_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
+_DEFAULT_RETRY_ATTEMPTS = 3
+_MAX_RETRY_ATTEMPTS = 8
+_DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
+_MAX_RETRY_DELAY_SECONDS = 20.0
+# Model inference has no side effects: resending a request whose connection
+# timed out or tore only costs tokens. Discovery and credential probes are not
+# resent after the connection opened.
+_MODEL_INFERENCE_OPERATIONS = frozenset(
+    {
+        "chat_completions",
+        "chat_completions_stream",
+        "responses",
+        "messages",
+        "generate_content",
+    }
+)
+# Transport failures after the connection opened that an inference request
+# may be resent after (httpx's ConnectTimeout is retried for every request).
+_RESENDABLE_TRANSPORT_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounded automatic retries for one provider."""
+
+    attempts: int = _DEFAULT_RETRY_ATTEMPTS
+    backoff_seconds: float = _DEFAULT_RETRY_BACKOFF_SECONDS
+
+
+def _bounded_number(value: Any, fallback: float, *, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        # diagnostic-expected: an unset or unreadable tuning value keeps the default
+        return fallback
+    if number != number or number < 0:
+        return fallback
+    return min(number, maximum)
+
+
+def retry_policy(config: ProviderConfig) -> RetryPolicy:
+    """Resolve retry limits from provider options, then the environment.
+
+    One attempt disables retries; operators keep that escape hatch per provider
+    (``options.retry_attempts``) and per deployment.
+    """
+
+    attempts = _bounded_number(
+        config.options.get(
+            "retry_attempts", os.getenv("NEBULA_PROVIDER_RETRY_ATTEMPTS")
+        ),
+        _DEFAULT_RETRY_ATTEMPTS,
+        maximum=_MAX_RETRY_ATTEMPTS,
+    )
+    backoff = _bounded_number(
+        config.options.get(
+            "retry_backoff_seconds", os.getenv("NEBULA_PROVIDER_RETRY_BACKOFF_SECONDS")
+        ),
+        _DEFAULT_RETRY_BACKOFF_SECONDS,
+        maximum=_MAX_RETRY_DELAY_SECONDS,
+    )
+    return RetryPolicy(attempts=max(1, int(attempts)), backoff_seconds=backoff)
+
+
+_DEFAULT_NATIVE_REQUEST_TIMEOUT_SECONDS = 600.0
+_MAX_NATIVE_REQUEST_TIMEOUT_SECONDS = 3600.0
+_NATIVE_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
+def _native_request_timeout(config: ProviderConfig) -> float:
+    """Seconds one non-streamed generation may take to answer.
+
+    The Anthropic, Responses, Gemini and Bedrock adapters, and non-streamed
+    Chat Completions (every routing step, mission specialist and utility call
+    on OpenRouter, local runtimes and gateways), receive the whole generation
+    as one response, so the read timeout bounds the entire answer, not the gap
+    between tokens. Streams and catalog calls keep the client default. Operators
+    tune it per provider
+    (``options.request_timeout_seconds``) and per deployment; a config built
+    with an explicit ``timeout_seconds`` keeps it when neither is set.
+    """
+
+    fallback = (
+        config.timeout_seconds
+        if "timeout_seconds" in config.model_fields_set
+        else _DEFAULT_NATIVE_REQUEST_TIMEOUT_SECONDS
+    )
+    seconds = _bounded_number(
+        config.options.get(
+            "request_timeout_seconds",
+            os.getenv("NEBULA_PROVIDER_REQUEST_TIMEOUT_SECONDS"),
+        ),
+        fallback,
+        maximum=_MAX_NATIVE_REQUEST_TIMEOUT_SECONDS,
+    )
+    return seconds if seconds > 0 else fallback
+
+
+def _native_http_timeout(config: ProviderConfig) -> httpx.Timeout:
+    read = _native_request_timeout(config)
+    return httpx.Timeout(read, connect=min(_NATIVE_CONNECT_TIMEOUT_SECONDS, read))
+
+
+@dataclass(frozen=True)
+class _InferenceDeadline:
+    """One non-streamed generation's allowance, shared by its resends.
+
+    The request timeout is how long one generation may take (a thinking
+    model's whole answer arrives as one body, #498). Automatic resends used to
+    get a fresh allowance each, so a stalled upstream held the turn, and its
+    provider slot, for ``attempts`` allowances: 3 x 600 s, about 30 minutes,
+    before the operator saw a failure. A resend now gets only what is left of
+    the first allowance, and none is started once it is spent.
+    """
+
+    seconds: float
+    expires_at: float
+
+    @classmethod
+    def start(cls, config: ProviderConfig) -> _InferenceDeadline:
+        seconds = _native_request_timeout(config)
+        return cls(seconds, asyncio.get_running_loop().time() + seconds)
+
+    def remaining(self) -> float:
+        return self.expires_at - asyncio.get_running_loop().time()
+
+    def admits(self, delay: float) -> bool:
+        """Whether a resend after ``delay`` still has time to answer."""
+
+        return self.remaining() - delay > 0
+
+    def spent(self) -> ProviderOverloadedError:
+        return ProviderOverloadedError(
+            "provider request timed out: no answer within the "
+            f"{self.seconds:g} s request allowance"
+        )
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Read a Retry-After header in either seconds or HTTP-date form."""
+
+    raw = (response.headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(float(raw), _MAX_RETRY_DELAY_SECONDS))
+    except ValueError:
+        # diagnostic-expected: Retry-After may carry an HTTP date instead of seconds
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        # diagnostic-expected: an unreadable Retry-After falls back to backoff
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delay = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, min(delay, _MAX_RETRY_DELAY_SECONDS))
+
+
+def _retry_delay(policy: RetryPolicy, attempt: int, retry_after: float | None) -> float:
+    delay = min(policy.backoff_seconds * (2 ** (attempt - 1)), _MAX_RETRY_DELAY_SECONDS)
+    if retry_after is not None:
+        delay = min(max(delay, retry_after), _MAX_RETRY_DELAY_SECONDS)
+    # Jitter keeps concurrent turns from resending in lockstep.
+    return delay + random.uniform(0.0, delay * 0.25)
+
+
+def _record_retry(
+    config: ProviderConfig,
+    *,
+    operation: str,
+    attempt: int,
+    policy: RetryPolicy,
+    delay: float,
+    status_code: int | None,
+) -> None:
+    record_diagnostic(
+        "warning",
+        "providers",
+        "providers.request.retried",
+        "A transient provider failure was retried automatically.",
+        outcome="retrying",
+        stage="providers",
+        retryable=True,
+        safe_failure_cause="The provider was temporarily unavailable.",
+        metadata={
+            "provider_id": config.id,
+            "operation": operation,
+            "attempt": attempt,
+            "attempts_allowed": policy.attempts,
+            "retry_delay_seconds": round(delay, 3),
+            "http_status": status_code,
+        },
+    )
+
+
+def _exhausted(
+    error: ProviderOverloadedError, attempts: int
+) -> ProviderOverloadedError:
+    """Name the automatic attempts so the operator knows retrying is not new."""
+
+    return ProviderOverloadedError(
+        f"{error} after {attempts} attempts",
+        status_code=error.status_code,
+        retry_after=error.retry_after,
+    )
+
+
+async def _send_with_retry(
+    config: ProviderConfig,
+    send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    operation: str,
+    retry_transient_statuses: bool = True,
+    inspect: Callable[[httpx.Response], ProviderError | None] | None = None,
+) -> httpx.Response:
+    """Send a provider request, retrying only transient upstream failures.
+
+    The caller still raises for the returned response; only an exhausted
+    transient failure is raised here, so its message can name the attempts.
+    Health probes pass ``retry_transient_statuses=False``: a 429 or 5xx from a
+    discovery endpoint is handed back with its status instead of being retried
+    to exhaustion, while a refused connection is still retried. ``inspect``
+    reads a successful response for a failure its body reports (an error
+    object inside an HTTP 200); a transient one is retried like its status.
+    Model inference resends share the first attempt's request allowance (see
+    ``_InferenceDeadline``).
+    """
+
+    policy = retry_policy(config)
+    deadline = (
+        _InferenceDeadline.start(config)
+        if operation in _MODEL_INFERENCE_OPERATIONS
+        else None
+    )
+    attempt = 1
+    while True:
+        status_code: int | None = None
+        try:
+            if deadline is None or attempt == 1:
+                response = await send()
+            else:
+                try:
+                    async with asyncio.timeout(deadline.remaining()):
+                        response = await send()
+                except TimeoutError as exc:
+                    # diagnostic-expected: raised as the exhausted allowance
+                    raise _exhausted(deadline.spent(), attempt) from exc
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # A connection that was never established cannot have reached the
+            # provider, so the same request is safe to send again.
+            delay = _retry_delay(policy, attempt, None)
+            if attempt >= policy.attempts or (
+                deadline is not None and not deadline.admits(delay)
+            ):
+                raise _transport_failure(exc) from exc
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_016",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+        except httpx.HTTPError as exc:
+            # Anything after the connection opened (a read timeout, a torn
+            # body) may have reached the provider. Only model inference is
+            # resent: it has no side effects, so a resend costs tokens alone.
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_018",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            if operation not in _MODEL_INFERENCE_OPERATIONS or not isinstance(
+                exc, _RESENDABLE_TRANSPORT_ERRORS
+            ):
+                raise _transport_failure(exc) from exc
+            interrupted = _interrupted_transport(exc)
+            delay = _retry_delay(policy, attempt, None)
+            if attempt >= policy.attempts or (
+                deadline is not None and not deadline.admits(delay)
+            ):
+                # A read timeout that spent the whole allowance lands here.
+                raise (
+                    _exhausted(interrupted, attempt) if attempt > 1 else interrupted
+                ) from exc
+        else:
+            error: ProviderError | None
+            if response.is_error:
+                error = _safe_error(response) if retry_transient_statuses else None
+            else:
+                error = inspect(response) if inspect is not None else None
+            if not isinstance(error, ProviderOverloadedError):
+                return response
+            delay = _retry_delay(policy, attempt, error.retry_after)
+            if attempt >= policy.attempts or (
+                deadline is not None and not deadline.admits(delay)
+            ):
+                if attempt == 1:
+                    return response
+                raise _exhausted(error, attempt)
+            status_code = error.status_code
+        _record_retry(
+            config,
+            operation=operation,
+            attempt=attempt,
+            policy=policy,
+            delay=delay,
+            status_code=status_code,
+        )
+        await asyncio.sleep(delay)
+        attempt += 1
+
+
+def _transport_failure(exc: httpx.HTTPError) -> ProviderError:
+    """Name a transport failure; ``str(httpx.ReadTimeout(""))`` is empty."""
+
+    reason = redact_text(" ".join(str(exc).split()))[:300]
+    kind = type(exc).__name__
+    verb = "timed out" if isinstance(exc, httpx.TimeoutException) else "failed"
+    return ProviderError(
+        f"provider request {verb} ({kind})" + (f": {reason}" if reason else "")
+    )
+
+
+def _interrupted_transport(exc: httpx.HTTPError) -> ProviderOverloadedError:
+    """A timed-out or torn inference request: transient, so retryable."""
+
+    return ProviderOverloadedError(str(_transport_failure(exc)))
+
+
+_SSE_LINE_END = re.compile(r"\r\n|\r|\n")
+
+
+async def _sse_data_frames(response: httpx.Response) -> AsyncGenerator[str, None]:
+    """Yield the ``data`` payload of each server-sent event.
+
+    SSE lines end only at LF, CRLF or CR. ``aiter_lines()`` follows
+    ``str.splitlines()`` and also breaks at U+2028, U+2029 and U+0085, which a
+    gateway serialising with ``ensure_ascii=False`` sends raw inside JSON
+    strings; one frame would then arrive as two unparsable halves. Several
+    ``data:`` lines in one event are joined with a newline, as the format
+    requires; comments and other fields are skipped.
+
+    Two gateway habits are read as what they mean. A gateway that separates
+    events with a single LF makes one event of several JSON chunks; when the
+    joined text does not parse but every line does, each line is its own
+    frame. An ``event: error`` whose data is plain text is handed on as an
+    ``{"error": ...}`` frame, so its text reaches the operator.
+    """
+
+    buffer = ""
+    data_lines: list[str] = []
+    event = ""
+
+    def dispatch() -> list[str]:
+        nonlocal event
+        name, event = event, ""
+        if not data_lines:
+            return []
+        lines = list(data_lines)
+        data_lines.clear()
+        payload = "\n".join(lines)
+        if name == "error":
+            return [_error_event_payload(payload)]
+        if len(lines) > 1 and not _is_json(payload):
+            pieces = [line for line in lines if line.strip()]
+            if all(_is_json(piece) or piece.strip() == "[DONE]" for piece in pieces):
+                return pieces
+        return [payload]
+
+    def take(line: str) -> list[str]:
+        nonlocal event
+        if not line:
+            return dispatch()
+        if line.startswith("data:"):
+            data_lines.append(line[5:].removeprefix(" "))
+        elif line.startswith("event:"):
+            event = line[6:].strip()
+        return []
+
+    async for chunk in response.aiter_text():
+        buffer += chunk
+        start = 0
+        while True:
+            match = _SSE_LINE_END.search(buffer, start)
+            if match is None:
+                break
+            if match.group() == "\r" and match.end() == len(buffer):
+                # A trailing CR may be the first half of a CRLF; wait for more.
+                break
+            payloads = take(buffer[start : match.start()])
+            start = match.end()
+            for payload in payloads:
+                yield payload
+        buffer = buffer[start:]
+    tail = buffer.rstrip("\r")
+    if tail:
+        take(tail)
+    for payload in dispatch():
+        yield payload
+
+
+def _is_json(text: str) -> bool:
+    try:
+        json.loads(text)
+    except ValueError:  # diagnostic-expected: the answer is that it is not JSON
+        return False
+    return True
+
+
+def _error_event_payload(payload: str) -> str:
+    """Hand an ``event: error`` on as an in-band error frame."""
+
+    text = payload.strip()
+    try:
+        data = json.loads(text)
+    except ValueError:  # diagnostic-expected: plain-text error events are wrapped below
+        data = None
+    if isinstance(data, dict):
+        return payload if data.get("error") else json.dumps({"error": data})
+    return json.dumps({"error": {"message": text or "provider sent an error event"}})
+
+
+def _stream_frame_data(encoded: str) -> dict[str, Any] | None:
+    """Decode one Chat Completions SSE payload.
+
+    ``None`` is a keepalive: a payload that is not JSON at all (``ping``) or
+    JSON that is not a chunk object. A payload that starts like JSON but does
+    not parse is a damaged chunk; dropping it could silently lose part of the
+    reply, so it is a typed failure instead.
+    """
+
+    try:
+        data = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        if encoded.startswith(("{", "[")):
+            raise ProviderResponseError(
+                f"provider sent a malformed stream chunk: {exc.msg}"
+            ) from exc
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _record_keepalive_skipped(config: ProviderConfig, encoded: str) -> None:
+    record_diagnostic(
+        "warning",
+        "providers",
+        "providers.stream.keepalive_skipped",
+        "A provider stream carried a data frame that is not a reply chunk; "
+        "Core skipped it.",
+        outcome="fallback",
+        stage="providers",
+        retryable=False,
+        metadata={
+            "provider_id": config.id,
+            "byte_count": len(encoded.encode("utf-8", errors="surrogatepass")),
+        },
+    )
+
+
+async def _frames_until_finished_close(
+    frames: AsyncIterator[str], finished: Callable[[], bool], config: ProviderConfig
+) -> AsyncIterator[str]:
+    """Pass frames on; a transport failure after the finish reason ends them.
+
+    A reply is whole once its finish reason has arrived. A proxy that then
+    tears the connection or stalls until the read timeout, instead of sending
+    ``[DONE]``, must not turn the finished reply into an error.
+    """
+
+    try:
+        async for frame in frames:
+            yield frame
+    except httpx.HTTPError as exc:
+        if not finished():
+            raise
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.stream.closed_after_finish",
+            "The provider connection failed after the reply finished; Core "
+            "kept the finished reply.",
+            outcome="fallback",
+            stage="providers",
+            retryable=False,
+            metadata={"provider_id": config.id, "exception_type": type(exc).__name__},
+        )
+
+
+def _frame_has_output(data: Any) -> bool:
+    """Whether a Chat Completions chunk carries anything the operator sees."""
+
+    if not isinstance(data, dict):
+        return True
+    choices = data.get("choices")
+    if not isinstance(choices, list):
+        return bool(choices)
+    for choice in choices:
+        if not isinstance(choice, dict):
+            return True
+        if choice.get("finish_reason") or _delta_has_output(choice.get("delta")):
+            return True
+    return False
+
+
+def _delta_has_output(delta: Any) -> bool:
+    """Whether one streamed ``delta`` carries text, reasoning or a call."""
+
+    return isinstance(delta, dict) and bool(
+        delta.get("tool_calls")
+        or delta.get("function_call")
+        or _openai_message_content(delta)
+        or _openai_refusal(delta)
+        or _openai_message_reasoning(delta)
+    )
+
+
+# Role-only and heartbeat frames precede an in-band error; a peek past this
+# many frames without output stops looking and hands them to the parser.
+_LEADING_FRAME_LIMIT = 32
+
+
+async def _leading_frames(
+    frames: AsyncIterator[str],
+) -> tuple[list[str], ProviderOverloadedError | None]:
+    """Read frames up to the first output so a leading transient error frame
+    can be replayed exactly as the equivalent HTTP status would be."""
+
+    buffered: list[str] = []
+    async for encoded in frames:
+        buffered.append(encoded)
+        stripped = encoded.strip()
+        if not stripped:
+            continue
+        if stripped == "[DONE]":
+            return buffered, None
+        try:
+            data = _stream_frame_data(stripped)
+        except (
+            ProviderResponseError
+        ):  # diagnostic-expected: the parser reports the malformed frame
+            return buffered, None
+        # A keepalive (``data`` of None) is not output; keep looking.
+        failure = _stream_error_frame(data)
+        if failure is None and isinstance(data, dict):
+            # A transient finish reason (DeepSeek's out-of-capacity, Z.ai's
+            # network_error) on a frame that carries nothing else ended the
+            # reply before any output, so it is replayed like a 503.
+            choice = _first_choice(data)
+            if not _delta_has_output(choice.get("delta")):
+                failure = _finish_reason_failure(choice)
+        if isinstance(failure, ProviderOverloadedError):
+            return buffered, failure
+        if (
+            failure is not None
+            or (data is not None and _frame_has_output(data))
+            or len(buffered) >= _LEADING_FRAME_LIMIT
+        ):
+            return buffered, None
+    return buffered, None
+
+
+async def _replay_frames(
+    leading: list[str], frames: AsyncIterator[str]
+) -> AsyncIterator[str]:
+    for encoded in leading:
+        yield encoded
+    async for encoded in frames:
+        yield encoded
+
+
+@asynccontextmanager
+async def _stream_with_retry(
+    config: ProviderConfig,
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json: dict[str, Any],
+    operation: str,
+) -> AsyncIterator[AsyncIterator[str]]:
+    """Open a streaming provider response and hand over its SSE data frames,
+    retrying before the first token.
+
+    A transient failure arrives either as an HTTP status or, once the gateway
+    has already sent its 200, as a leading ``{"error": {...}}`` frame; both
+    are replayed while attempts remain. Once any output frame has been read
+    the stream is never replayed: a partial answer must not be silently
+    restarted underneath the operator. A timed-out or torn connection before
+    any output is resent the same way. Transport failures are raised as
+    provider errors that name the failure, since httpx's own text is often
+    empty.
+    """
+
+    policy = retry_policy(config)
+    attempt = 1
+    while True:
+        started = False
+        status_code: int | None = None
+        error: ProviderError | None = None
+        try:
+            async with client.stream(method, url, json=json) as response:
+                if response.is_error:
+                    await response.aread()
+                    error = _safe_error(response)
+                else:
+                    frames = _sse_data_frames(response)
+                    leading, error = await _leading_frames(frames)
+                    if error is None:
+                        started = True
+                        yield _replay_frames(leading, frames)
+                        return
+                    await frames.aclose()
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            if started or attempt >= policy.attempts:
+                raise _transport_failure(exc) from exc
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_017",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            delay = _retry_delay(policy, attempt, None)
+        except httpx.HTTPError as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_019",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            # Before any output a timed-out or torn stream is resent like a
+            # transient status; after output it never is.
+            if (
+                started
+                or operation not in _MODEL_INFERENCE_OPERATIONS
+                or not isinstance(exc, _RESENDABLE_TRANSPORT_ERRORS)
+            ):
+                raise _transport_failure(exc) from exc
+            interrupted = _interrupted_transport(exc)
+            if attempt >= policy.attempts:
+                raise (
+                    _exhausted(interrupted, attempt) if attempt > 1 else interrupted
+                ) from exc
+            delay = _retry_delay(policy, attempt, None)
+        else:
+            # A consumed stream already returned, so only an error reaches here.
+            assert error is not None
+            if not isinstance(error, ProviderOverloadedError):
+                raise error
+            if attempt >= policy.attempts:
+                if attempt == 1:
+                    raise error
+                raise _exhausted(error, attempt)
+            status_code = error.status_code
+            delay = _retry_delay(policy, attempt, error.retry_after)
+        _record_retry(
+            config,
+            operation=operation,
+            attempt=attempt,
+            policy=policy,
+            delay=delay,
+            status_code=status_code,
+        )
+        await asyncio.sleep(delay)
+        attempt += 1
+
+
+_CONTEXT_ERROR_CODES = frozenset(
+    {
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "max_tokens_exceeded",
+        "prompt_too_long",
+        # llama.cpp's error ``type``; Anthropic's HTTP 413 ``type``.
+        "exceed_context_size_error",
+        "request_too_large",
+    }
+)
+_CONTEXT_ERROR_MARKERS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "prompt is too long",
+    "prompt too long",
+    "too many tokens",
+    # Gemini: "The input token count (N) exceeds the maximum number of tokens
+    # allowed (M)."; Bedrock: "Input is too long for requested model."
+    "input token count",
+    "input is too long",
+    # xAI: "This model's maximum prompt length is N but the request contains
+    # M tokens"; llama.cpp: "the request exceeds the available context size";
+    # Kimi: "Your request exceeded model token limit"; OpenRouter (Poolside):
+    # "exceeds the maximum allowed input length"; Anthropic HTTP 413:
+    # "Request exceeds the maximum size".
+    "maximum prompt length",
+    "context size",
+    "exceeded model token limit",
+    "maximum allowed input length",
+    "request exceeds the maximum size",
+)
+# A 429 carrying one of these is spent quota or billing, not a busy upstream.
+_QUOTA_ERROR_CODES = frozenset(
+    {"insufficient_quota", "billing_not_active", "billing_hard_limit_reached"}
+)
+# String error codes (``code`` or ``type``) that name a transient upstream
+# failure where no HTTP status is given, as in OpenRouter's mid-stream frames.
+_TRANSIENT_ERROR_CODES = frozenset(
+    {
+        "server_error",
+        "internal_error",
+        "internal_server_error",
+        "service_unavailable",
+        "overloaded",
+        "overloaded_error",
+        "timeout",
+        "upstream_error",
+    }
+)
+# OpenRouter's wording for an upstream that failed or dropped the connection.
+_TRANSIENT_ERROR_MARKERS = ("provider returned error", "provider disconnected")
+
+
+def _error_detail(body: Any) -> tuple[str | None, str | None]:
+    """Return the operator-readable message and code from a provider error body."""
+
+    error = body.get("error", {}) if isinstance(body, dict) else {}
+    detail = (error.get("message") if isinstance(error, dict) else None) or (
+        body.get("message") if isinstance(body, dict) else None
+    )
+    if detail is None and isinstance(error, str) and error.strip():
+        detail = error
+    raw_code = (error.get("code") if isinstance(error, dict) else None) or (
+        body.get("code") if isinstance(body, dict) else None
+    )
+    error_code = str(raw_code).casefold() if raw_code is not None else None
+    # OpenRouter wraps the upstream provider's reason in metadata.raw; the
+    # generic "Provider returned error" alone is not actionable.
+    metadata = error.get("metadata") if isinstance(error, dict) else None
+    upstream = metadata.get("raw") if isinstance(metadata, dict) else None
+    if isinstance(upstream, str) and upstream.strip():
+        try:
+            decoded = json.loads(upstream)
+            inner = decoded.get("error") if isinstance(decoded, dict) else None
+            upstream = (
+                inner.get("message") if isinstance(inner, dict) else None
+            ) or upstream
+        except ValueError:  # diagnostic-expected: upstream reason is not JSON; the raw text is shown instead
+            pass
+        upstream = " ".join(str(upstream).split())[:400]
+        detail = f"{detail} (upstream: {upstream})" if detail else upstream
+    return (str(detail) if detail is not None else None), error_code
+
+
+# An upstream that holds decoding to the declared functions refuses a call
+# the model emitted anyway. A request that declared none gets this for any
+# call, so it is the model reaching for a tool rather than a broken route.
+_TOOL_REJECTION_CODES = frozenset({"tool_use_failed"})
+_TOOL_REJECTION_MARKERS = (
+    # Sail Research through OpenRouter.
+    "undeclared or disallowed function",
+    # Groq.
+    "not in request.tools",
+    "tool call validation failed",
+)
+
+
+def _tool_call_refused(detail: str | None, error_code: str | None) -> bool:
+    normalized = str(detail or "").casefold()
+    return error_code in _TOOL_REJECTION_CODES or any(
+        marker in normalized for marker in _TOOL_REJECTION_MARKERS
+    )
+
+
+def _context_length_error(detail: str | None, error_code: str | None) -> bool:
+    normalized = str(detail or "").casefold()
+    return error_code in _CONTEXT_ERROR_CODES or any(
+        marker in normalized for marker in _CONTEXT_ERROR_MARKERS
+    )
+
+
+def _quota_exhausted(body: Any, detail: str | None, error_code: str | None) -> bool:
+    """Whether a rate-limit answer names spent quota or billing instead."""
+
+    error = body.get("error") if isinstance(body, dict) else None
+    kind = error.get("type") if isinstance(error, dict) else None
+    codes = {error_code, kind.casefold() if isinstance(kind, str) else None}
+    return (
+        bool(codes & _QUOTA_ERROR_CODES)
+        or "insufficient_quota" in str(detail or "").casefold()
+    )
+
+
+def _error_type(body: Any) -> str | None:
+    """The body's ``error.type``, which some vendors send in place of a code."""
+
+    error = body.get("error") if isinstance(body, dict) else None
+    kind = error.get("type") if isinstance(error, dict) else None
+    return kind.casefold() if isinstance(kind, str) else None
+
+
+def _transient_error(body: Any, detail: str | None, error_code: str | None) -> bool:
+    """Whether an error that carries no HTTP status names a transient failure."""
+
+    normalized = str(detail or "").casefold()
+    return bool({error_code, _error_type(body)} & _TRANSIENT_ERROR_CODES) or any(
+        marker in normalized for marker in _TRANSIENT_ERROR_MARKERS
+    )
+
+
+def _safe_error(response: httpx.Response) -> ProviderError:
+    request_id = response.headers.get("x-request-id") or response.headers.get(
+        "request-id"
+    )
+    error_code: str | None = None
+    body: Any = None
+    try:
+        body = response.json()
+        detail, error_code = _error_detail(body)
+    except (ValueError, AttributeError) as caught_error:
+        record_caught_exception(
+            "providers",
+            "providers.providers.caught_failure_004",
+            "A handled providers operation raised an exception.",
+            caught_error,
+            stage="providers",
+        )
+        detail = None
+    suffix = f" request_id={request_id}" if request_id else ""
+    message = f"provider returned HTTP {response.status_code}{suffix}" + (
+        f": {detail}" if detail else ""
+    )
+    context_overflow = (
+        _context_length_error(detail, error_code)
+        or _error_type(body) in _CONTEXT_ERROR_CODES
+    )
+    # Some runtimes (Ollama) answer an overflow with a 5xx; it is checked
+    # before the overload branch, because resending it cannot succeed.
+    if (
+        response.status_code in {400, 413, 422} or response.status_code >= 500
+    ) and context_overflow:
+        return ProviderContextLengthError(message)
+    if response.status_code in {400, 422} and _tool_call_refused(detail, error_code):
+        return ProviderToolCallError(message)
+    if response.status_code == 429 and _quota_exhausted(body, detail, error_code):
+        # Retrying spent quota only burns attempts and then mislabels the
+        # billing cause as a transient overload.
+        return ProviderQuotaError(
+            f"provider quota or billing limit reached (HTTP 429){suffix}"
+            + (f": {detail}" if detail else "")
+        )
+    if response.status_code in _RETRYABLE_STATUS_CODES:
+        return ProviderOverloadedError(
+            message,
+            status_code=response.status_code,
+            retry_after=_retry_after_seconds(response),
+        )
+    return ProviderError(message)
+
+
+def _stream_error_frame(data: Any) -> ProviderError | None:
+    """Map an in-band error frame on a 200 SSE stream to a provider failure.
+
+    OpenRouter, vLLM and other OpenAI-compatible gateways report an upstream
+    failure that happens after the response headers were sent as a
+    ``{"error": {...}}`` data frame instead of an HTTP status. Ignoring the
+    frame ends the stream as an empty, successful reply. A frame relaying a
+    transient status is as replayable as that status would have been.
+    """
+
+    if not isinstance(data, dict) or not data.get("error"):
+        return None
+    detail, error_code = _error_detail(data)
+    message = "provider reported an error while streaming" + (
+        f": {detail}" if detail else ""
+    )
+    if _context_length_error(detail, error_code):
+        return ProviderContextLengthError(message)
+    if _tool_call_refused(detail, error_code):
+        # Checked before the transient statuses: replaying the identical
+        # request invites the same call, so it is not an overload to retry.
+        return ProviderToolCallError(message)
+    status = int(error_code) if error_code and error_code.isdigit() else None
+    if status == 429 and _quota_exhausted(data, detail, error_code):
+        return ProviderQuotaError(message)
+    if status in _RETRYABLE_STATUS_CODES or (
+        status is None and _transient_error(data, detail, error_code)
+    ):
+        return ProviderOverloadedError(message, status_code=status)
+    return ProviderError(message)
+
+
+# Vendor stop outcomes that explain why a 200 reply carries no answer. Read as
+# an ordinary empty reply they made chat skip the call the model attempted, or
+# re-ask a safeguard that had already refused.
+_CONTEXT_WINDOW_STOP_REASON = "model_context_window_exceeded"
+_GEMINI_BLOCKED_FINISH_REASONS = frozenset(
+    {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"}
+)
+_GEMINI_MALFORMED_CALL_FINISH_REASONS = frozenset(
+    {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"}
+)
+_GEMINI_UNSPECIFIED_BLOCK_REASONS = frozenset(
+    {"BLOCK_REASON_UNSPECIFIED", "BLOCKED_REASON_UNSPECIFIED"}
+)
+_BEDROCK_BLOCKED_STOP_REASONS = frozenset({"guardrail_intervened", "content_filtered"})
+_BEDROCK_MALFORMED_STOP_REASONS = frozenset(
+    {"malformed_tool_use", "malformed_model_output"}
+)
+# Responses `error.code` values that report a transient upstream failure.
+_RESPONSES_TRANSIENT_ERROR_CODES = frozenset(
+    {"server_error", "server_is_overloaded", "rate_limit_exceeded", "slow_down"}
+)
+
+
+def _context_window_stop(reason: str) -> ProviderContextLengthError:
+    return ProviderContextLengthError(
+        f"provider stopped at the model context window ({reason})"
+    )
+
+
+def _raise_malformed_tool_call(request: ModelRequest, reason: str) -> None:
+    """Raise for a botched call when the request offered tools to call.
+
+    Without tools, or with calling turned off, there was nothing to call: the
+    empty reply goes to the caller's own recovery, which asks again for prose.
+    Gemini reports a call made with calling off as UNEXPECTED_TOOL_CALL.
+    """
+
+    if request.tools and request.tool_choice != ToolChoice.NONE:
+        raise ProviderMalformedToolCallError(
+            f"provider returned a malformed tool call ({reason})"
+        )
+
+
+def _anthropic_refusal(data: dict[str, Any]) -> ProviderRefusalError:
+    details = data.get("stop_details")
+    details = details if isinstance(details, dict) else {}
+    reason = "refusal"
+    category = details.get("category")
+    if isinstance(category, str) and category:
+        reason += f" (category: {category})"
+    explanation = details.get("explanation")
+    if isinstance(explanation, str) and explanation.strip():
+        reason += f": {' '.join(explanation.split())[:300]}"
+    return ProviderRefusalError(reason)
+
+
+def _raise_gemini_outcome(request: ModelRequest, data: dict[str, Any]) -> None:
+    candidates = data.get("candidates") or [{}]
+    finish_reason = candidates[0].get("finishReason")
+    feedback = data.get("promptFeedback")
+    block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+    if (
+        not finish_reason
+        and block_reason
+        and block_reason not in _GEMINI_UNSPECIFIED_BLOCK_REASONS
+    ):
+        raise ProviderRefusalError(f"prompt blocked ({block_reason})")
+    if finish_reason in _GEMINI_BLOCKED_FINISH_REASONS:
+        blocked = [
+            str(rating.get("category"))
+            for rating in candidates[0].get("safetyRatings") or []
+            if isinstance(rating, dict) and rating.get("blocked")
+        ]
+        raise ProviderRefusalError(
+            f"{finish_reason} ({', '.join(blocked)})" if blocked else finish_reason
+        )
+    if finish_reason in _GEMINI_MALFORMED_CALL_FINISH_REASONS:
+        # finishMessage holds the model's half-written call; it stays out of
+        # the error text.
+        _raise_malformed_tool_call(request, finish_reason)
+
+
+def _raise_bedrock_outcome(request: ModelRequest, data: dict[str, Any]) -> None:
+    stop_reason = data.get("stopReason")
+    if stop_reason == _CONTEXT_WINDOW_STOP_REASON:
+        raise _context_window_stop(stop_reason)
+    if stop_reason in _BEDROCK_BLOCKED_STOP_REASONS:
+        raise ProviderRefusalError(stop_reason)
+    if stop_reason in _BEDROCK_MALFORMED_STOP_REASONS:
+        _raise_malformed_tool_call(request, stop_reason)
+
+
+def _raise_responses_outcome(data: dict[str, Any]) -> None:
+    """Type a Responses 200 that failed or was cut by the content filter."""
+
+    if data.get("status") == "failed":
+        detail, error_code = _error_detail(data)
+        described = ": ".join(
+            part
+            for part in (error_code, " ".join(str(detail or "").split())[:400])
+            if part
+        )
+        if error_code and "policy" in error_code:
+            # cyber_policy, bio_policy, misalignment_policy_violation.
+            raise ProviderRefusalError(described)
+        message = "provider reported a failed response" + (
+            f": {described}" if described else ""
+        )
+        if _context_length_error(detail, error_code):
+            raise ProviderContextLengthError(message)
+        if _quota_exhausted(data, detail, error_code):
+            raise ProviderQuotaError(message)
+        if error_code in _RESPONSES_TRANSIENT_ERROR_CODES:
+            raise ProviderOverloadedError(message)
+        raise ProviderError(message)
+    details = data.get("incomplete_details")
+    if isinstance(details, dict) and details.get("reason") == "content_filter":
+        raise ProviderRefusalError("content_filter")
+
+
+# Tool arguments are read without ``strict``: a raw newline or tab inside a
+# string is what the model meant, and JSON only forbids it on the wire.
+_ARGUMENTS_DECODER = json.JSONDecoder(strict=False)
+_JSON_WHITESPACE = re.compile(r"[ \t\n\r]*")
+# A backslash with the escape it starts, or a lone backslash that starts none.
+_JSON_ESCAPE = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])?')
+
+
+def _after_whitespace(text: str, index: int) -> int:
+    match = _JSON_WHITESPACE.match(text, index)
+    return match.end() if match else index
+
+
+def _decoded_repeated_value(text: str) -> tuple[Any, bool]:
+    """One JSON value, or that value followed by itself; and which it was.
+
+    Some routes send a call's complete arguments once more after streaming
+    them, so the assembled text is the object and then the same object again.
+    Anything else after the first value is a defect, reported as the decoder
+    found it.
+    """
+
+    try:
+        return _ARGUMENTS_DECODER.decode(text), False
+    except json.JSONDecodeError as exc:
+        if not exc.msg.startswith("Extra data"):
+            raise
+        first, end = _ARGUMENTS_DECODER.raw_decode(text, _after_whitespace(text, 0))
+        while True:
+            start = _after_whitespace(text, end)
+            if start == len(text):
+                return first, True
+            try:
+                again, end = _ARGUMENTS_DECODER.raw_decode(text, start)
+            except json.JSONDecodeError:
+                raise exc from None
+            if again != first:
+                raise exc from None
+
+
+def _decoded_arguments(value: Any) -> tuple[Any, str | None]:
+    """Decode tool arguments, and name the repair that made them readable.
+
+    Models write regexes and Windows paths with backslashes that start no
+    JSON escape (pi-mono's ``repairJson`` doubles them), and some routes
+    repeat the whole object. Arguments cut off mid-value are never completed:
+    a guessed ending could run a different command than the model meant.
+    """
+
+    if not isinstance(value, str):
+        return json.loads(value), None
+    try:
+        parsed, repeated = _decoded_repeated_value(value)
+    except json.JSONDecodeError as exc:
+        if not exc.msg.startswith("Invalid \\escape"):
+            raise
+        repaired = _JSON_ESCAPE.sub(
+            lambda match: match.group(0) if match.group(1) else "\\\\", value
+        )
+        try:
+            parsed, repeated = _decoded_repeated_value(repaired)
+        except json.JSONDecodeError:
+            raise exc from None
+        return parsed, "invalid_escape"
+    return parsed, "repeated_arguments" if repeated else None
+
+
+def _arguments(
+    value: Any, *, diagnostic_metadata: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed, repair = _decoded_arguments(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        metadata = {
+            **(diagnostic_metadata or {}),
+            "format": "json",
+        }
+        if isinstance(value, str):
+            encoded = value.encode("utf-8", errors="surrogatepass")
+            metadata.update(
+                {
+                    "byte_count": len(encoded),
+                    "fingerprint": hashlib.sha256(encoded).hexdigest(),
+                }
+            )
+        if isinstance(exc, json.JSONDecodeError):
+            # The decoder's reason and coordinates identify the malformed
+            # shape without retaining the arguments, which may contain a
+            # command, credential or other operator data.
+            metadata["validation"] = (
+                f"{exc.msg}; line {exc.lineno}; column {exc.colno}; character {exc.pos}"
+            )
+        failure = ProviderToolCallError("provider returned malformed tool arguments")
+        failure.__cause__ = exc
+        record_caught_exception(
+            "providers",
+            "providers.tool_arguments.invalid_json",
+            "A provider returned tool arguments that were not valid JSON.",
+            failure,
+            stage="tool_arguments",
+            metadata=metadata,
+            sensitive_detail=(
+                f"Exact provider tool arguments (UTF-8):\n{value}"
+                if isinstance(value, str)
+                else None
+            ),
+        )
+        raise failure from exc
+    if repair is not None:
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.tool_arguments.repaired",
+            "A provider returned tool arguments JSON does not allow; Core read "
+            "them the way the model wrote them.",
+            outcome="fallback",
+            stage="tool_arguments",
+            retryable=False,
+            metadata={**(diagnostic_metadata or {}), "repair": repair},
+        )
+    if isinstance(parsed, str):
+        # Some gateways encode the arguments string twice ("\"{...}\"").
+        try:
+            parsed = json.loads(parsed)
+        except ValueError:  # diagnostic-expected: a plain string is refused just below
+            pass
+    if not isinstance(parsed, dict):
+        raise ProviderToolCallError("provider returned non-object tool arguments")
+    return parsed
+
+
+def _token_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(0, int(value))
+
+
+def _openai_usage(usage: Any, *, billed: bool = False) -> ModelUsage:
+    """Read Chat Completions usage; gateways omit ``total_tokens`` or send null.
+
+    Goal token budgets gate on the total, so a missing one is summed rather
+    than recorded as zero. ``billed`` reads the cost the route reports
+    (OpenRouter's ``usage.cost``); other gateways' cost fields are not trusted.
+    """
+
+    if not isinstance(usage, dict):
+        return ModelUsage()
+    prompt = _token_count(usage.get("prompt_tokens"))
+    completion = _token_count(usage.get("completion_tokens"))
+    details = usage.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    # OpenAI and OpenRouter report cache hits in the prompt details, DeepSeek
+    # in a field of its own. OpenRouter reports a Claude route's cache writes
+    # there too; ``prompt_tokens`` already counts both.
+    cached = _token_count(details.get("cached_tokens")) or _token_count(
+        usage.get("prompt_cache_hit_tokens")
+    )
+    written = _token_count(details.get("cache_write_tokens"))
+    return ModelUsage(
+        input_tokens=prompt,
+        output_tokens=completion,
+        total_tokens=_token_count(usage.get("total_tokens")) or prompt + completion,
+        cached_input_tokens=min(cached, prompt) if prompt else cached,
+        cache_creation_input_tokens=min(written, prompt) if prompt else written,
+        cost_usd=_openrouter_billed_cost(usage) if billed else None,
+    )
+
+
+def _openrouter_billed_cost(usage: dict[str, Any]) -> float | None:
+    """OpenRouter's billed cost for one generation, upstream included.
+
+    With the operator's own upstream key (BYOK) ``cost`` is OpenRouter's fee
+    and the upstream bills ``cost_details.upstream_inference_cost`` itself.
+    """
+
+    def amount(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) and value >= 0 else None
+
+    cost = amount(usage.get("cost"))
+    if cost is None or usage.get("is_byok") is not True:
+        return cost
+    details = usage.get("cost_details")
+    upstream = (
+        amount(details.get("upstream_inference_cost"))
+        if isinstance(details, dict)
+        else None
+    )
+    return cost + (upstream or 0.0)
+
+
+def _tool_call_slot(
+    call_parts: dict[int, dict[str, str]], call_id: str, name: str, index: int | None
+) -> int | None:
+    """The assembled call a delta continues, or ``None`` when it starts a part.
+
+    Looked up by id first, then by index, then by arrival, as the AI SDK's
+    streaming tool-call tracker does: a new id on a known index is a new call
+    (Ollama reports every call at index 0). A delta with neither id nor name
+    on an index no call has used is kept apart; ``_assembled_tool_calls``
+    decides at the end whether it is part of the call before it.
+    """
+
+    if call_id:
+        for key, part in call_parts.items():
+            if part["id"] == call_id:
+                return key
+    latest = max(call_parts) if call_parts else None
+    if index is not None:
+        at_index = [
+            key for key, part in call_parts.items() if part["index"] == str(index)
+        ]
+        if not at_index:
+            return None
+        part = call_parts[at_index[-1]]
+        # A different id or name on the same index starts the next call;
+        # vendors that resend them on every fragment resend the same ones. An
+        # id that follows its name completes the call the name opened.
+        if (call_id and part["id"]) or (name and part["name"] and name != part["name"]):
+            return None
+        return at_index[-1]
+    if not call_id and not name:
+        # Unindexed argument fragments continue the most recent call.
+        return latest
+    if call_id and not name and latest is not None and not call_parts[latest]["id"]:
+        # An unindexed id arriving after the name it belongs to.
+        return latest
+    return None
+
+
+def _merge_tool_call_deltas(call_parts: dict[int, dict[str, str]], items: Any) -> None:
+    """Fold one chunk's tool-call deltas into the calls assembled so far.
+
+    Calls are kept in arrival order. OpenAI keys fragments by ``index``;
+    vendors that omit it send whole calls per chunk, so two calls in one chunk
+    must never merge into one. ``id`` and ``name`` are taken once, because
+    vendors that resend them on every fragment would otherwise yield
+    ``call_1call_1``. Arguments sent as an object are the whole arguments so
+    far, so they replace rather than extend what arrived before. A call's
+    ``extra_content`` (a Gemini signature) is kept with it as JSON text.
+    """
+
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            function = {}
+        call_id = str(item.get("id") or "")
+        name = str(function.get("name") or "")
+        raw_index = item.get("index")
+        index = (
+            raw_index
+            if isinstance(raw_index, int) and not isinstance(raw_index, bool)
+            else None
+        )
+        key = _tool_call_slot(call_parts, call_id, name, index)
+        if key is None:
+            key = max(call_parts, default=-1) + 1
+            call_parts[key] = {
+                "id": "",
+                "name": "",
+                "arguments": "",
+                "index": "" if index is None else str(index),
+            }
+        current = call_parts[key]
+        current["id"] = current["id"] or call_id
+        current["name"] = current["name"] or name
+        extra = item.get("extra_content")
+        if isinstance(extra, dict):
+            current["extra_content"] = json.dumps(extra)
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            current["arguments"] = json.dumps(arguments)
+        else:
+            current["arguments"] += str(arguments or "")
+
+
+def _reads_as_object(text: str) -> bool:
+    """Whether assembled argument text is a whole JSON object."""
+
+    if not text.strip():
+        return False
+    try:
+        parsed, _repair = _decoded_arguments(text)
+    except json.JSONDecodeError:  # diagnostic-expected: judging a fragment
+        return False
+    return isinstance(parsed, dict)
+
+
+def _assembled_tool_calls(
+    request: ModelRequest,
+    call_parts: dict[int, dict[str, str]],
+    *,
+    diagnostic_metadata: dict[str, Any],
+) -> list[ToolCall]:
+    """Read the streamed calls, joining fragments that name no tool.
+
+    Every call names its function, so a part without a name is a piece of the
+    call before it that the route sent under its own index or id (a parser
+    that emits the tail of the arguments again after moving to the next
+    index). It joins that call when the two read as one object, and is
+    dropped otherwise. A nameless part with its own id and whole arguments is
+    a call whose name was lost, returned for the model to correct.
+    """
+
+    kept: list[dict[str, str]] = []
+    for _, part in sorted(call_parts.items()):
+        if part["name"] or not kept:
+            kept.append(dict(part))
+            continue
+        previous = kept[-1]
+        joined = previous["arguments"] + part["arguments"]
+        if _reads_as_object(joined):
+            previous["arguments"] = joined
+            continue
+        if part["id"] and _reads_as_object(part["arguments"]):
+            # A call of its own whose name was lost.
+            kept.append(dict(part))
+            continue
+        encoded = part["arguments"].encode("utf-8", errors="surrogatepass")
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.tool_call.stray_fragment",
+            "A provider streamed a tool-call fragment that belongs to no call; "
+            "Core dropped it and kept the calls around it.",
+            outcome="fallback",
+            stage="tool_arguments",
+            retryable=False,
+            metadata={
+                **diagnostic_metadata,
+                "byte_count": len(encoded),
+                "fingerprint": hashlib.sha256(encoded).hexdigest(),
+                "had_id": bool(part["id"]),
+            },
+        )
+    return [
+        _tool_call(
+            request,
+            call_id=part["id"],
+            name=part["name"],
+            arguments=part["arguments"],
+            diagnostic_metadata=diagnostic_metadata,
+            provider_metadata=(
+                {"extra_content": json.loads(part["extra_content"])}
+                if part.get("extra_content")
+                else None
+            ),
+        )
+        for part in kept
+    ]
+
+
+def _openai_text_parts(value: Any) -> str:
+    """Read visible text from an OpenAI-compatible content value."""
+
+    # Streamed deltas carry meaningful edge whitespace ("the" + " quick"), so
+    # text is kept exactly; only empty values are skipped.
+    parts: list[str] = []
+    if isinstance(value, str) and value:
+        parts.append(value)
+    elif isinstance(value, list):
+        for block in value:
+            if isinstance(block, str) and block:
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text") or block.get("content")
+            if (
+                block.get("type") in {None, "text", "output_text"}
+                and isinstance(text, str)
+                and text
+            ):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _openai_message_content(message: dict[str, Any]) -> str:
+    """Reply text only. Reasoning fields are not a substitute for content."""
+
+    return _openai_text_parts(message.get("content"))
+
+
+def _openai_refusal(message: dict[str, Any]) -> str:
+    """The model's own explanation when it declines, sent in place of content.
+
+    It is the reply the operator should read: shown as text, the turn ends
+    with the model's words instead of an empty answer that recovery would
+    keep asking the same model to fill.
+    """
+
+    value = message.get("refusal")
+    return value if isinstance(value, str) else ""
+
+
+def _openrouter_reasoning(
+    request: "ModelRequest", supported: set[str], *, mandatory: bool = False
+) -> dict[str, Any]:
+    """The reasoning object OpenRouter is sent for one request.
+
+    ``exclude: False`` asks for the thoughts to come back, which is what the
+    transcript shows the operator. An effort or a token ceiling is only added
+    when the route advertises the control: sending one it does not take costs
+    the request, and with ``require_parameters`` it can leave no eligible
+    endpoint at all. A model whose reasoning is ``mandatory`` refuses
+    ``none``, so it keeps its default instead of being asked and resent
+    (pi-mono and Cline never send it the disable either).
+    """
+
+    reasoning: dict[str, Any] = {"exclude": False}
+    if "reasoning" not in supported and supported:
+        return reasoning
+    if request.reasoning_effort is not None and not (
+        mandatory and request.reasoning_effort == "none"
+    ):
+        reasoning["effort"] = request.reasoning_effort
+    if request.reasoning_max_tokens is not None:
+        reasoning["max_tokens"] = request.reasoning_max_tokens
+    return reasoning
+
+
+def _refused_reasoning_off_retry(
+    payload: dict[str, Any], response: httpx.Response
+) -> dict[str, Any] | None:
+    """The payload to resend when a route refuses to skip reasoning.
+
+    Utility calls (capability probe, naming, retrieval planning, compaction,
+    scope import) and final-answer recovery ask for ``none`` to keep a short
+    budget for the answer; it is a preference, not a requirement. A model
+    whose reasoning is mandatory, or an OpenAI family with no ``none`` level,
+    answers 400, and the call is worth one more try with the model's default
+    reasoning. Each family's disable is undone: an effort of ``none``
+    (OpenRouter, OpenAI, Ollama), ``thinking: disabled`` (DeepSeek, Z.ai,
+    Anthropic) and a chat template's thinking switch set off. pi-mono and
+    Cline never send the disable to such models; only OpenRouter's catalog
+    says which they are, so elsewhere Core asks and falls back. A level the
+    operator chose is never dropped this way.
+    """
+
+    if response.status_code not in {400, 422}:
+        return None
+    detail = response.text.casefold()
+    if "reasoning" not in detail and "thinking" not in detail:
+        return None
+    retry = dict(payload)
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") == "none":
+        kept = {key: value for key, value in reasoning.items() if key != "effort"}
+        if kept:
+            retry["reasoning"] = kept
+        else:
+            del retry["reasoning"]
+    if payload.get("reasoning_effort") == "none":
+        del retry["reasoning_effort"]
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "disabled":
+        del retry["thinking"]
+    switches = payload.get("chat_template_kwargs")
+    if isinstance(switches, dict):
+        kept = {
+            key: value
+            for key, value in switches.items()
+            if not (key in _CHAT_TEMPLATE_THINKING_SWITCHES and value is False)
+        }
+        if kept != switches:
+            if kept:
+                retry["chat_template_kwargs"] = kept
+            else:
+                del retry["chat_template_kwargs"]
+    return None if retry == payload else retry
+
+
+def _refused_reasoning_summary_retry(
+    payload: dict[str, Any], response: httpx.Response
+) -> dict[str, Any] | None:
+    """The Responses payload to resend when reasoning summaries are refused.
+
+    Summaries are asked for so the transcript can show the thought; OpenAI
+    answers 400 to an organization not verified for them. The level itself
+    still applies, so only the summary is dropped.
+    """
+
+    reasoning = payload.get("reasoning")
+    if (
+        response.status_code not in {400, 422}
+        or not isinstance(reasoning, dict)
+        or "summary" not in reasoning
+        or "summar" not in response.text.casefold()
+    ):
+        return None
+    return {
+        **payload,
+        "reasoning": {
+            key: value for key, value in reasoning.items() if key != "summary"
+        },
+    }
+
+
+def _record_reasoning_off_refused(config: "ProviderConfig", model: str) -> None:
+    record_diagnostic(
+        "warning",
+        "providers",
+        "providers.reasoning.off_refused",
+        "The route refused a request to skip reasoning; Core asked "
+        "again with the model's default reasoning.",
+        outcome="fallback",
+        stage="providers",
+        retryable=False,
+        metadata={"provider_id": config.id, "model": model},
+    )
+
+
+def _openai_message_reasoning(message: dict[str, Any]) -> str:
+    """Model thoughts from OpenRouter/OpenAI-compatible reasoning channels.
+
+    The channels are alternative encodings of the same thought: OpenRouter sends
+    each fragment in both `reasoning` and `reasoning_details`. Read only the first
+    channel that carries text, or every streamed token would be repeated.
+    """
+
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            return value
+    parts: list[str] = []
+    details = message.get("reasoning_details")
+    if isinstance(details, list):
+        for item in details:
+            if isinstance(item, str) and item:
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or "")
+            if "encrypted" in kind:
+                continue
+            text = item.get("text") or item.get("summary") or item.get("content")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _reasoning_state(
+    provider_id: str,
+    model: str,
+    fields: dict[str, Any],
+    calls: Iterable[ToolCall] = (),
+) -> dict[str, Any] | None:
+    """Stamp a response's replay state with the route and model that made it.
+
+    A response whose only state is per call (a Gemini signature) is stamped
+    too: the stamp is what later proves the signature belongs to the model it
+    is sent back to.
+    """
+
+    if not fields and not any(call.provider_metadata for call in calls):
+        return None
+    return {"provider_id": provider_id, "model": model, **fields}
+
+
+def _replayed_batches(
+    request: ModelRequest, provider_id: str, model: str
+) -> list[tuple[list[ModelToolResult], dict[str, Any] | None]]:
+    """``request.tool_results`` regrouped into the responses that issued them.
+
+    Consecutive results of one ``response_group`` came from one routing
+    response and go back as one assistant message. A batch carries its
+    reasoning state only when this route and model produced it: a signature
+    or an encrypted blob is valid for that model alone (pi-mono
+    ``transformMessages`` drops them across models the same way).
+    """
+
+    batches: list[list[ModelToolResult]] = []
+    for result in request.tool_results:
+        if (
+            batches
+            and result.response_group is not None
+            and batches[-1][-1].response_group == result.response_group
+        ):
+            batches[-1].append(result)
+        else:
+            batches.append([result])
+    replayed: list[tuple[list[ModelToolResult], dict[str, Any] | None]] = []
+    for batch in batches:
+        state = next(
+            (result.reasoning_state for result in batch if result.reasoning_state),
+            None,
+        )
+        if state is not None and (
+            state.get("provider_id") != provider_id or state.get("model") != model
+        ):
+            state = None
+        replayed.append((batch, state))
+    return replayed
+
+
+def _call_metadata(
+    result: ModelToolResult, state: dict[str, Any] | None, key: str
+) -> Any:
+    """One call's replay metadata, only when its batch's route is this one."""
+
+    if state is None or not result.provider_metadata:
+        return None
+    return result.provider_metadata.get(key)
+
+
+def _result_text(result: ModelToolResult) -> str:
+    return (
+        json.dumps(result.output, sort_keys=True)
+        if isinstance(result.output, dict)
+        else result.output
+    )
+
+
+def _openai_reasoning_fields(
+    message: dict[str, Any], *, openrouter: bool
+) -> dict[str, Any]:
+    """The reasoning a Chat Completions route may need back on a later step."""
+
+    fields: dict[str, Any] = {}
+    content = message.get("reasoning_content")
+    if isinstance(content, str):
+        fields["reasoning_content"] = content
+    if openrouter:
+        text = message.get("reasoning")
+        if isinstance(text, str) and text:
+            fields["reasoning"] = text
+        details = message.get("reasoning_details")
+        # OpenRouter's SDK keeps ``[]`` when a route sent none; DeepSeek V4
+        # returns ``[]`` itself and fails a follow-up that omits it.
+        fields["reasoning_details"] = details if isinstance(details, list) else []
+    return fields
+
+
+def _merge_reasoning_details(accumulated: list[Any], fragments: list[Any]) -> None:
+    """Fold streamed ``reasoning_details`` fragments into whole entries.
+
+    As OpenRouter's SDK does: consecutive text (or summary) fragments form one
+    entry, keeping the first signature and format seen; encrypted and other
+    entries are discrete and kept as they arrive.
+    """
+
+    for detail in fragments:
+        if not isinstance(detail, dict):
+            continue
+        kind = detail.get("type")
+        field = {"reasoning.text": "text", "reasoning.summary": "summary"}.get(
+            str(kind)
+        )
+        last = accumulated[-1] if accumulated else None
+        if field is not None and isinstance(last, dict) and last.get("type") == kind:
+            last[field] = str(last.get(field) or "") + str(detail.get(field) or "")
+            for key in ("signature", "format"):
+                if not last.get(key) and detail.get(key):
+                    last[key] = detail[key]
+            continue
+        accumulated.append(dict(detail))
+
+
+# Reasoning in these formats is signed; an entry that lost its signature is
+# rejected upstream ("Invalid signature in thinking block"). OpenRouter's SDK
+# treats an entry without a format as Anthropic's.
+_OPENROUTER_SIGNED_FORMATS = frozenset({"anthropic-claude-v1", "google-gemini-v1"})
+
+
+def _openrouter_replay_details(details: list[Any]) -> list[Any]:
+    """``reasoning_details`` as OpenRouter's own SDK sends them back.
+
+    Echoed as received, an empty list included. Only reasoning text in a
+    signed format without its signature is dropped
+    (``convert-to-openrouter-chat-messages.ts``).
+    """
+
+    return [
+        detail
+        for detail in details
+        if not (
+            isinstance(detail, dict)
+            and detail.get("type") == "reasoning.text"
+            and (detail.get("format") or "anthropic-claude-v1")
+            in _OPENROUTER_SIGNED_FORMATS
+            and not detail.get("signature")
+        )
+    ]
+
+
+def _model_name(model: str) -> str:
+    return model.casefold().rsplit("/", 1)[-1]
+
+
+def _deepseek_model(model: str) -> bool:
+    return "deepseek" in _model_name(model)
+
+
+def _deepseek_v4_model(model: str) -> bool:
+    """DeepSeek V4 ids, versioned or aliased (Vercel ``isDeepSeekV4Model``)."""
+
+    name = _model_name(model)
+    return "deepseek-v4" in name or name.startswith(("deepseek-flash", "deepseek-pro"))
+
+
+def _replay_reasoning(
+    payload: dict[str, Any],
+    replayed: list[tuple[dict[str, Any], dict[str, Any] | None]],
+    flavor: ProviderFlavor,
+    model: str,
+) -> None:
+    """Give each replayed assistant message the reasoning its route expects.
+
+    ``replayed`` pairs each replayed tool-call message with its batch's
+    reasoning state (``None`` when there is none from this route and model).
+    """
+
+    if flavor == ProviderFlavor.OPENROUTER:
+        for message, state in replayed:
+            details = state.get("reasoning_details") if state else None
+            if not isinstance(details, list):
+                continue
+            kept = _openrouter_replay_details(details)
+            message["reasoning_details"] = kept
+            text = state.get("reasoning") if state else None
+            # Reasoning text without its details would reach the upstream as
+            # a thinking block with no signature.
+            if kept and isinstance(text, str) and text:
+                message["reasoning"] = text
+        if _deepseek_v4_model(model):
+            # V4 wants reasoning on every assistant message, and answers
+            # ``[]`` itself when it had none to show.
+            for message in payload["messages"]:
+                if message.get("role") == "assistant":
+                    message.setdefault("reasoning_details", [])
+        return
+    thinking = payload.get("thinking")
+    # Z.ai uses replayed reasoning only when it is told to keep it.
+    preserved = isinstance(thinking, dict) and thinking.get("clear_thinking") is False
+    if (
+        not preserved
+        and flavor != ProviderFlavor.DEEPSEEK
+        and not _deepseek_model(model)
+    ):
+        return
+    for message, state in replayed:
+        text = state.get("reasoning_content") if state else None
+        if isinstance(text, str):
+            message["reasoning_content"] = text
+    if _deepseek_v4_model(model):
+        # V4 requires the field on every assistant turn, earlier plain answers
+        # included; an empty string is the documented back-fill (Vercel,
+        # pi-mono and opencode all send ""). Earlier DeepSeek models must not
+        # be sent reasoning for past turns, so nothing is back-filled there.
+        for message in payload["messages"]:
+            if message.get("role") == "assistant":
+                message.setdefault("reasoning_content", "")
+
+
+def _vllm_grammar_schema(value: Any) -> Any:
+    """Remove validation-only keywords unsupported by vLLM's grammar compiler.
+
+    Nebula retains and validates the original schema at the broker boundary; this
+    copy is only the provider-facing grammar used to constrain model output.
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: _vllm_grammar_schema(item)
+            for key, item in value.items()
+            if key != "uniqueItems"
+        }
+    if isinstance(value, list):
+        return [_vllm_grammar_schema(item) for item in value]
+    return value
+
+
+# Reasoning families reject sampling parameters: OpenAI answers 400
+# "Unsupported parameter: 'temperature'" for the o-series and gpt-5 models.
+_OPENAI_REASONING_MODEL = re.compile(r"^(?:o\d+|gpt-5)(?:[-.]|$)")
+
+
+def _openai_reasoning_model(model: str) -> bool:
+    return _OPENAI_REASONING_MODEL.match(model.rsplit("/", 1)[-1]) is not None
+
+
+def _host_in(base_url: str, domains: Iterable[str]) -> bool:
+    host = (httpx.URL(base_url).host or "").casefold()
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+_DEEPSEEK_HOSTS = ("deepseek.com",)
+# Z.ai's international API and BigModel (open.bigmodel.cn) are the same API.
+_ZAI_HOSTS = ("z.ai", "bigmodel.cn")
+# DeepSeek takes low, high and max (Vercel AI's DeepSeek provider mapping).
+_DEEPSEEK_EFFORT: dict[str, str] = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+}
+# GLM-5.2 and later on Z.ai take high and max; a lower level keeps the
+# model's default depth with thinking on (pi-mono's Z.ai mapping).
+_ZAI_EFFORT: dict[str, str] = {"high": "high", "xhigh": "max"}
+# Ollama's OpenAI endpoint validates reasoning_effort as none|low|medium|high|max.
+_OLLAMA_EFFORT: dict[str, str] = {
+    "none": "none",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "max",
+}
+_FAMILY_VERSION = {
+    "deepseek": re.compile(r"deepseek-v(\d+)(?:\.(\d+))?"),
+    "glm": re.compile(r"glm-(\d+)(?:\.(\d+))?"),
+    "qwen": re.compile(r"qwen(\d+)(?:\.(\d+))?"),
+}
+# The chat-template variables that switch thinking on and off.
+_CHAT_TEMPLATE_THINKING_SWITCHES = frozenset({"thinking", "enable_thinking"})
+
+
+def _family_version(model: str, family: str) -> tuple[int, int] | None:
+    match = _FAMILY_VERSION[family].search(_model_name(model))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _glm_thinks(model: str) -> bool:
+    """GLM 4.5 and later have a thinking mode; GLM-4 and earlier do not."""
+
+    version = _family_version(model, "glm")
+    return version is not None and version >= (4, 5)
+
+
+def _chat_template_thinking_switch(model: str) -> str | None:
+    """The chat-template variable a self-hosted model's thinking follows.
+
+    DeepSeek V3.1 and later read ``thinking``; GLM 4.5+ and Qwen3 read
+    ``enable_thinking`` (vLLM and SGLang recipes, pi-mono's chat-template
+    format). A template without either has no switch to send.
+    """
+
+    deepseek = _family_version(model, "deepseek")
+    if deepseek is not None:
+        return "thinking" if deepseek >= (3, 1) else None
+    if _glm_thinks(model):
+        return "enable_thinking"
+    qwen = _family_version(model, "qwen")
+    return "enable_thinking" if qwen is not None and qwen >= (3, 0) else None
+
+
+def _chat_reasoning_controls(
+    config: "ProviderConfig", request: "ModelRequest", model: str
+) -> dict[str, Any]:
+    """Reasoning fields for a Chat Completions route other than OpenRouter.
+
+    Each family takes the level in its own shape, so it is translated per
+    flavor, host and model; a route with no documented control is left alone
+    rather than sent a parameter it may reject. ``None`` leaves the model's
+    default.
+    """
+
+    effort = request.reasoning_effort
+    if effort is None:
+        return {}
+    if config.flavor == ProviderFlavor.DEEPSEEK or _host_in(
+        config.base_url, _DEEPSEEK_HOSTS
+    ):
+        # Vercel AI's DeepSeek provider, LiteLLM and pi-mono.
+        if effort == "none":
+            return {"thinking": {"type": "disabled"}}
+        return {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": _DEEPSEEK_EFFORT[effort],
+        }
+    if _host_in(config.base_url, _ZAI_HOSTS):
+        if not _glm_thinks(model):
+            return {}
+        if effort == "none":
+            return {"thinking": {"type": "disabled"}}
+        # ``clear_thinking: false`` keeps earlier steps' reasoning, which is
+        # also what makes Z.ai use the reasoning Core replays (opencode,
+        # pi-mono).
+        fields: dict[str, Any] = {
+            "thinking": {"type": "enabled", "clear_thinking": False}
+        }
+        version = _family_version(model, "glm")
+        if version is not None and version >= (5, 2) and effort in _ZAI_EFFORT:
+            fields["reasoning_effort"] = _ZAI_EFFORT[effort]
+        return fields
+    if config.flavor in {ProviderFlavor.VLLM, ProviderFlavor.SGLANG}:
+        switch = _chat_template_thinking_switch(model)
+        if switch is None:
+            return {}
+        return {"chat_template_kwargs": {switch: effort != "none"}}
+    if config.flavor == ProviderFlavor.OLLAMA:
+        if _chat_template_thinking_switch(model) is None:
+            return {}
+        return {"reasoning_effort": _OLLAMA_EFFORT[effort]}
+    if _openai_reasoning_model(model):
+        # OpenAI's own reasoning families take the effort as a scalar,
+        # directly and via Azure, Foundry or a gateway.
+        return {"reasoning_effort": effort}
+    return {}
+
+
+_STRICT_SCHEMA_MAPPINGS = frozenset(
+    {"properties", "$defs", "definitions", "patternProperties"}
+)
+_STRICT_SCHEMA_DATA = frozenset({"enum", "const", "examples", "required"})
+
+
+def _openai_strict_schema(schema: Any) -> bool:
+    """Whether OpenAI strict mode accepts a schema as written.
+
+    Strict mode requires every property to be listed in ``required`` and every
+    object to forbid additional properties, and rejects ``default`` and
+    ``uniqueItems``. Nebula keeps the real schema and validates arguments at
+    the broker, so a schema strict mode would reject is sent without strict
+    instead of failing the whole request.
+    """
+
+    if isinstance(schema, list):
+        return all(_openai_strict_schema(item) for item in schema)
+    if not isinstance(schema, dict):
+        return True
+    if "default" in schema or "uniqueItems" in schema:
+        return False
+    properties = schema.get("properties")
+    kind = schema.get("type")
+    is_object = kind == "object" or (isinstance(kind, list) and "object" in kind)
+    if is_object or isinstance(properties, dict):
+        required = schema.get("required") or []
+        if (
+            not isinstance(required, list)
+            or schema.get("additionalProperties") is not False
+        ):
+            return False
+        if isinstance(properties, dict) and set(properties) - set(required):
+            return False
+    for key, value in schema.items():
+        if key in _STRICT_SCHEMA_DATA:
+            continue
+        if key in _STRICT_SCHEMA_MAPPINGS:
+            if isinstance(value, dict) and not all(
+                _openai_strict_schema(item) for item in value.values()
+            ):
+                return False
+            continue
+        if not _openai_strict_schema(value):
+            return False
+    return True
+
+
+# Provider prompt caching. OpenAI, DeepSeek, Gemini 2.5+, Grok and most other
+# routes reuse a repeated prompt prefix on their own. Claude reuses one only
+# up to an explicit breakpoint, at most four a request, natively, on Bedrock
+# and through OpenRouter, so those adapters mark where reusable prefixes end.
+# A marker changes no prompt bytes, and a prefix below the model's minimum is
+# served uncached rather than refused. Chat keeps the prefix stable between
+# requests; the breakpoints are what let Claude routes charge the cache-read
+# rate for it. ``options.prompt_caching: false`` on a profile switches the
+# markers off for an endpoint that refuses them.
+_CACHE_BREAKPOINTS = 4
+_EPHEMERAL_CACHE = {"type": "ephemeral"}
+_BEDROCK_CACHE_POINT = {"cachePoint": {"type": "default"}}
+# OpenAI documents no maximum length for ``prompt_cache_key``; a longer
+# session id is hashed to one that is safely short.
+_PROMPT_CACHE_KEY_MAX = 64
+
+
+def _prompt_caching(config: ProviderConfig) -> bool:
+    return config.options.get("prompt_caching", True) is not False
+
+
+def _anthropic_caches(config: ProviderConfig, model: str) -> bool:
+    """Every Claude model on the Messages API takes ``cache_control``.
+
+    Another model behind an Anthropic-compatible endpoint (DeepSeek, Z.ai)
+    caches on its own terms and is not sent it.
+    """
+
+    return _prompt_caching(config) and "claude" in _model_name(model)
+
+
+def _prompt_cache_key(config: ProviderConfig, request: ModelRequest) -> str | None:
+    """OpenAI's cache routing key: the chat session, whose requests share prefixes.
+
+    Only OpenAI itself is sent it; a strict OpenAI-compatible server answers
+    400 to a field it does not know.
+    """
+
+    if config.flavor != ProviderFlavor.OPENAI or not _prompt_caching(config):
+        return None
+    key = request.metadata.get("chat_session_id")
+    if not key:
+        return None
+    if len(key) > _PROMPT_CACHE_KEY_MAX:
+        return hashlib.sha256(key.encode()).hexdigest()
+    return key
+
+
+def _one_shot(request: ModelRequest) -> bool:
+    """A request nothing will send again as its prefix: one message, no tools.
+
+    Compaction, naming and other utility calls are sent once. Marking their
+    message would pay Claude's cache-write premium on tokens no later request
+    reads, so only their instructions (shared with every such call) are marked.
+    """
+
+    conversation = [message for message in request.messages if message.role != "system"]
+    return len(conversation) <= 1 and not request.tools and not request.tool_results
+
+
+def _cache_anchors(
+    roles: list[str],
+    conversation_end: int,
+    markable: Callable[[int], bool],
+    limit: int,
+) -> list[int]:
+    """Messages whose last block ends a prefix worth caching, most useful first.
+
+    ``roles`` are the payload's messages, the conversation (history and the
+    current operator message) first and then this turn's tool replay from
+    ``conversation_end``. In order:
+
+    1. The newest message: the step or turn after this one re-sends
+       everything up to here. Claude also looks for an earlier cached prefix
+       up to 20 blocks back from a breakpoint, which is how the previous
+       step's breakpoint is read.
+    2. The operator message before the current one. It stays put while the
+       current message gains a tool-history checkpoint and older tool results
+       are cleared to receipts, so those rewrites no longer re-bill the whole
+       conversation, and the next turn reads it back.
+    3. The current operator message, ahead of the tool replay, when a
+       breakpoint is still free.
+    """
+
+    anchors: list[int] = []
+    newest = next(
+        (index for index in reversed(range(len(roles))) if markable(index)), None
+    )
+    if newest is not None:
+        anchors.append(newest)
+    current = conversation_end - 1
+    earlier = next(
+        (
+            index
+            for index in reversed(range(max(current, 0)))
+            if roles[index] == "user" and markable(index)
+        ),
+        None,
+    )
+    if earlier is not None:
+        anchors.append(earlier)
+    if 0 <= current < len(roles) and roles[current] == "user" and markable(current):
+        anchors.append(current)
+    return list(dict.fromkeys(anchors))[: max(limit, 0)]
+
+
+def _anthropic_cache_block(block: Any) -> bool:
+    """Whether a Messages content block can carry ``cache_control``.
+
+    Thinking blocks cannot, and an empty text block is refused with one.
+    """
+
+    if not isinstance(block, dict):
+        return False
+    kind = block.get("type")
+    if kind in {"thinking", "redacted_thinking"}:
+        return False
+    return kind != "text" or bool(block.get("text"))
+
+
+def _anthropic_cache_markable(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content)
+    return isinstance(content, list) and any(
+        _anthropic_cache_block(block) for block in content
+    )
+
+
+def _mark_anthropic_message(message: dict[str, Any]) -> None:
+    """Put a breakpoint on the message's last block that can carry one."""
+
+    content = message["content"]
+    if isinstance(content, str):
+        message["content"] = [
+            {"type": "text", "text": content, "cache_control": dict(_EPHEMERAL_CACHE)}
+        ]
+        return
+    index = next(
+        index
+        for index in reversed(range(len(content)))
+        if _anthropic_cache_block(content[index])
+    )
+    # A copy: thinking and tool blocks can be shared with the replay state.
+    message["content"] = [
+        *content[:index],
+        {**content[index], "cache_control": dict(_EPHEMERAL_CACHE)},
+        *content[index + 1 :],
+    ]
+
+
+def _mark_anthropic_cache(
+    payload: dict[str, Any], request: ModelRequest, conversation_end: int
+) -> None:
+    """Messages API breakpoints: tools, system, then the conversation anchors.
+
+    The last tool definition caches the tools alone, which still pays off
+    when the instructions change between turns; the system block caches tools
+    and instructions together.
+    """
+
+    used = 0
+    tools = payload.get("tools")
+    if tools:
+        tools[-1] = {**tools[-1], "cache_control": dict(_EPHEMERAL_CACHE)}
+        used += 1
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        payload["system"] = [
+            {"type": "text", "text": system, "cache_control": dict(_EPHEMERAL_CACHE)}
+        ]
+        used += 1
+    if _one_shot(request):
+        return
+    messages = payload["messages"]
+    for index in _cache_anchors(
+        [str(message.get("role")) for message in messages],
+        conversation_end,
+        lambda index: _anthropic_cache_markable(messages[index]),
+        _CACHE_BREAKPOINTS - used,
+    ):
+        _mark_anthropic_message(messages[index])
+
+
+def _bedrock_caches(config: ProviderConfig, model: str) -> bool:
+    """Whether Converse takes ``cachePoint`` blocks for this model.
+
+    Claude 4 and later take them in tools, system and messages. Amazon Nova
+    takes them only in system and messages, caches at most 20K tokens, and
+    already caches every text prompt implicitly at the cache-read rate, so it
+    is left to that. Other families reject the block.
+    """
+
+    if not _prompt_caching(config):
+        return False
+    claude = _claude_model(model)
+    return claude is not None and claude[1] is not None and claude[1] >= (4, 0)
+
+
+def _mark_bedrock_cache(
+    kwargs: dict[str, Any], request: ModelRequest, conversation_end: int
+) -> None:
+    """Converse cache points in the positions the Messages API gets them.
+
+    A cache point is a block of its own after the content it closes. Marked
+    before adjacent same-role messages merge, so each stays at the end of the
+    message it was chosen for.
+    """
+
+    used = 0
+    tool_config = kwargs.get("toolConfig")
+    if isinstance(tool_config, dict) and tool_config.get("tools"):
+        tool_config["tools"] = [*tool_config["tools"], dict(_BEDROCK_CACHE_POINT)]
+        used += 1
+    if kwargs.get("system"):
+        kwargs["system"] = [*kwargs["system"], dict(_BEDROCK_CACHE_POINT)]
+        used += 1
+    if _one_shot(request):
+        return
+    messages = kwargs["messages"]
+    for index in _cache_anchors(
+        [str(message.get("role")) for message in messages],
+        conversation_end,
+        lambda index: any(
+            block != {"text": ""} for block in messages[index]["content"]
+        ),
+        _CACHE_BREAKPOINTS - used,
+    ):
+        messages[index] = {
+            **messages[index],
+            "content": [*messages[index]["content"], dict(_BEDROCK_CACHE_POINT)],
+        }
+
+
+def _openrouter_caches(config: ProviderConfig, model: str) -> bool:
+    """Claude through OpenRouter, which passes ``cache_control`` on to it.
+
+    Gemini 2.5 and later cache implicitly with no write or storage charge,
+    where an explicit breakpoint would add both; every other upstream caches
+    on its own. A generic OpenAI-compatible server is never sent the field.
+    """
+
+    return (
+        config.flavor == ProviderFlavor.OPENROUTER
+        and _prompt_caching(config)
+        and model.casefold().lstrip("~").startswith("anthropic/")
+    )
+
+
+def _openrouter_cache_markable(message: dict[str, Any]) -> bool:
+    # OpenRouter documents breakpoints in system and user content. Tool
+    # results reach Claude as user content, and a breakpoint on a tool
+    # message's text part is honoured (a later step reads through it).
+    if message.get("role") not in {"system", "user", "tool"}:
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content)
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        for part in content
+    )
+
+
+def _mark_openrouter_message(message: dict[str, Any]) -> None:
+    content = message["content"]
+    if isinstance(content, str):
+        message["content"] = [
+            {"type": "text", "text": content, "cache_control": dict(_EPHEMERAL_CACHE)}
+        ]
+        return
+    index = next(
+        index
+        for index in reversed(range(len(content)))
+        if isinstance(content[index], dict)
+        and content[index].get("type") == "text"
+        and content[index].get("text")
+    )
+    message["content"] = [
+        *content[:index],
+        {**content[index], "cache_control": dict(_EPHEMERAL_CACHE)},
+        *content[index + 1 :],
+    ]
+
+
+def _mark_openrouter_cache(
+    payload: dict[str, Any], request: ModelRequest, conversation_end: int
+) -> None:
+    """Chat Completions content-part breakpoints for Claude on OpenRouter.
+
+    OpenRouter documents none on tool definitions; the system breakpoint
+    covers them, since Claude renders tools ahead of the system prompt.
+    """
+
+    messages = payload["messages"]
+    used = 0
+    leading = 0
+    while leading < len(messages) and messages[leading].get("role") == "system":
+        leading += 1
+    if leading and _openrouter_cache_markable(messages[leading - 1]):
+        _mark_openrouter_message(messages[leading - 1])
+        used += 1
+    if _one_shot(request):
+        return
+    for index in _cache_anchors(
+        [str(message.get("role")) for message in messages],
+        conversation_end,
+        lambda index: index >= leading and _openrouter_cache_markable(messages[index]),
+        _CACHE_BREAKPOINTS - used,
+    ):
+        _mark_openrouter_message(messages[index])
+
+
+def _anthropic_usage(usage: Any) -> ModelUsage:
+    """Messages API usage with ``input_tokens`` meaning the whole prompt.
+
+    Anthropic reports cache reads and writes beside ``input_tokens``, which
+    then counts only the uncached remainder. Chat budgets, goals, context
+    calibration and cost estimates read ``input_tokens`` as the prompt size,
+    as OpenAI and OpenRouter report it, so the three are summed.
+    """
+
+    values = usage if isinstance(usage, dict) else {}
+    read = _token_count(values.get("cache_read_input_tokens"))
+    written = _token_count(values.get("cache_creation_input_tokens"))
+    prompt = _token_count(values.get("input_tokens")) + read + written
+    output = _token_count(values.get("output_tokens"))
+    return ModelUsage(
+        input_tokens=prompt,
+        output_tokens=output,
+        total_tokens=prompt + output,
+        cached_input_tokens=read,
+        cache_creation_input_tokens=written,
+    )
+
+
+def _bedrock_usage(usage: Any) -> ModelUsage:
+    """Converse usage, normalized as :func:`_anthropic_usage` is.
+
+    With caching, ``inputTokens`` counts only tokens neither read from nor
+    written to the cache (AWS: total input = inputTokens +
+    cacheReadInputTokens + cacheWriteInputTokens).
+    """
+
+    values = usage if isinstance(usage, dict) else {}
+    read = _token_count(values.get("cacheReadInputTokens"))
+    written = _token_count(values.get("cacheWriteInputTokens"))
+    prompt = _token_count(values.get("inputTokens")) + read + written
+    output = _token_count(values.get("outputTokens"))
+    return ModelUsage(
+        input_tokens=prompt,
+        output_tokens=output,
+        total_tokens=max(_token_count(values.get("totalTokens")), prompt + output),
+        cached_input_tokens=read,
+        cache_creation_input_tokens=written,
+    )
+
+
+def _responses_usage(usage: Any) -> ModelUsage:
+    """Responses usage; ``input_tokens`` already includes cached tokens."""
+
+    values = usage if isinstance(usage, dict) else {}
+    prompt = _token_count(values.get("input_tokens"))
+    output = _token_count(values.get("output_tokens"))
+    details = values.get("input_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    read = _token_count(details.get("cached_tokens"))
+    written = _token_count(details.get("cache_write_tokens"))
+    return ModelUsage(
+        input_tokens=prompt,
+        output_tokens=output,
+        total_tokens=_token_count(values.get("total_tokens")) or prompt + output,
+        cached_input_tokens=min(read, prompt) if prompt else read,
+        cache_creation_input_tokens=min(written, prompt) if prompt else written,
+    )
+
+
+class OpenAIResponsesProvider(ModelProvider):
+    """OpenAI Responses API adapter.
+
+    Function tools use the flattened Responses shape documented by OpenAI;
+    commands are never parsed out of prose.
+    """
+
+    def _headers(self) -> dict[str, str]:
+        return self._bearer_or_key_headers()
+
+    def _payload(self, request: ModelRequest, model: str) -> dict[str, Any]:
+        wire_names = _wire_tool_names(request)
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": [
+                _openai_responses_message(message) for message in request.messages
+            ],
+            # Nebula replays history itself and never reads stored items, so
+            # engagement data is not kept server-side by default.
+            "store": False,
+        }
+        for batch, state in _replayed_batches(request, self.config.id, model):
+            # Encrypted reasoning goes back ahead of the calls it led to; with
+            # nothing stored server-side it is the only copy (Codex, Vercel).
+            # Commentary rides along in output order, still in its own phase.
+            items = state.get("reasoning_items") if state else None
+            payload["input"].extend(items if isinstance(items, list) else [])
+            if batch[0].response_text:
+                payload["input"].append(
+                    {"role": "assistant", "content": batch[0].response_text}
+                )
+            payload["input"].extend(
+                {
+                    "type": "function_call",
+                    "call_id": result.call_id,
+                    "name": wire_names.get(result.name, result.name),
+                    "arguments": json.dumps(result.arguments, sort_keys=True),
+                }
+                for result in batch
+            )
+            for result in batch:
+                output: str | list[dict[str, Any]] = _result_text(result)
+                if result.attachments:
+                    output = [
+                        {"type": "input_text", "text": output},
+                        *_openai_responses_message(
+                            ModelMessage(role="user", content=result.attachments)
+                        )["content"],
+                    ]
+                payload["input"].append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": result.call_id,
+                        "output": output,
+                    }
+                )
+        if _openai_reasoning_model(model):
+            payload["include"] = ["reasoning.encrypted_content"]
+            if request.reasoning_effort is not None:
+                # Summaries are what the transcript can show of the thought;
+                # there is none to ask for when reasoning is off.
+                payload["reasoning"] = {
+                    "effort": request.reasoning_effort,
+                    **(
+                        {"summary": "auto"}
+                        if request.reasoning_effort != "none"
+                        else {}
+                    ),
+                }
+        if request.instructions:
+            payload["instructions"] = request.instructions
+        if request.max_output_tokens:
+            payload["max_output_tokens"] = request.max_output_tokens
+        if request.temperature is not None and not _openai_reasoning_model(model):
+            payload["temperature"] = request.temperature
+        if request.tools:
+            payload["parallel_tool_calls"] = request.parallel_tool_calls
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "name": wire_names.get(tool.name, tool.name),
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                    # Strict mode is a request-level contract: one schema it
+                    # rejects fails every tool in the call.
+                    **(
+                        {"strict": True}
+                        if tool.strict and _openai_strict_schema(tool.input_schema)
+                        else {}
+                    ),
+                }
+                for tool in request.tools
+            ]
+            if request.tool_choice in {ToolChoice.REQUIRED, ToolChoice.NONE}:
+                payload["tool_choice"] = request.tool_choice.value
+        if request.response_schema:
+            payload["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "nebula_response",
+                    "strict": _openai_strict_schema(request.response_schema),
+                    "schema": request.response_schema,
+                }
+            }
+        if request.metadata:
+            payload["metadata"] = request.metadata
+        cache_key = _prompt_cache_key(self.config, request)
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
+        return payload
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        model = self.require(request)
+        payload = self._payload(request, model)
+        async with self._client(
+            self._headers(), timeout=_native_http_timeout(self.config)
+        ) as client:
+            response = await self._post(
+                client,
+                self._path("/v1/responses"),
+                payload,
+                operation="responses",
+            )
+            retry = _refused_reasoning_off_retry(payload, response)
+            if retry is not None:
+                _record_reasoning_off_refused(self.config, model)
+            else:
+                retry = _refused_reasoning_summary_retry(payload, response)
+                if retry is not None:
+                    record_diagnostic(
+                        "warning",
+                        "providers",
+                        "providers.reasoning.summary_refused",
+                        "The route refused reasoning summaries; Core asked "
+                        "again at the same level without them.",
+                        outcome="fallback",
+                        stage="providers",
+                        retryable=False,
+                        metadata={"provider_id": self.config.id, "model": model},
+                    )
+            if retry is not None:
+                response = await self._post(
+                    client,
+                    self._path("/v1/responses"),
+                    retry,
+                    operation="responses",
+                )
+        if response.is_error:
+            raise _safe_error(response)
+        data = response.json()
+        _raise_responses_outcome(data)
+        text_parts: list[str] = []
+        summaries: list[str] = []
+        commentary: list[str] = []
+        refused = False
+        calls: list[ToolCall] = []
+        reasoning_items: list[dict[str, Any]] = []
+        for item in data.get("output", []):
+            if item.get("type") == "reasoning":
+                summary = item.get("summary")
+                summaries.extend(
+                    part["text"]
+                    for part in (summary if isinstance(summary, list) else [])
+                    if isinstance(part, dict)
+                    and part.get("type") == "summary_text"
+                    and isinstance(part.get("text"), str)
+                )
+            if item.get("type") == "reasoning" and isinstance(
+                item.get("encrypted_content"), str
+            ):
+                # Only an encrypted item can be sent back: nothing is stored.
+                reasoning_items.append(
+                    {
+                        "type": "reasoning",
+                        **(
+                            {"id": item["id"]}
+                            if isinstance(item.get("id"), str)
+                            else {}
+                        ),
+                        "summary": item.get("summary") or [],
+                        "encrypted_content": item["encrypted_content"],
+                    }
+                )
+            elif item.get("type") == "function_call":
+                if item.get("status") == "incomplete":
+                    # Cut off by the output limit, which finish_reason reports;
+                    # its arguments were never finished.
+                    continue
+                calls.append(
+                    _tool_call(
+                        request,
+                        call_id=item.get("call_id") or item.get("id"),
+                        name=item.get("name"),
+                        arguments=item.get("arguments"),
+                        diagnostic_metadata={
+                            "adapter": self.config.kind.value,
+                            "model_id": data.get("model") or model,
+                            "provider": self.config.id,
+                            "status": data.get("status"),
+                            "vendor_request_id": data.get("id"),
+                        },
+                    )
+                )
+            elif item.get("type") == "message":
+                message_text: list[str] = []
+                message_refused = False
+                for content in item.get("content", []):
+                    if content.get("type") in {"output_text", "text"}:
+                        message_text.append(content.get("text", ""))
+                    elif content.get("type") == "refusal":
+                        message_refused = True
+                        message_text.append(content.get("refusal") or "")
+                refused = refused or message_refused
+                if item.get("phase") != "commentary" or message_refused:
+                    if message_text:
+                        text_parts.append("".join(message_text))
+                    continue
+                # The route labels this message as mid-turn preamble, not the
+                # answer, so it reads as reasoning. It goes back in that phase:
+                # replayed without it, the model can take it as a final answer.
+                said = "".join(message_text)
+                if said.strip():
+                    commentary.append(said)
+                    reasoning_items.append(
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "commentary",
+                            "content": [{"type": "output_text", "text": said}],
+                        }
+                    )
+        if refused and not "".join(text_parts).strip():
+            raise ProviderRefusalError("refusal")
+        incomplete = data.get("incomplete_details")
+        return _adapter_response(
+            request,
+            provider_id=self.config.id,
+            model=data.get("model", model),
+            text="\n\n".join(text_parts),
+            reasoning="\n\n".join(
+                part for part in [*summaries, *commentary] if part.strip()
+            ),
+            tool_calls=calls,
+            usage=_responses_usage(data.get("usage")),
+            # "incomplete" alone hides the output limit chat's recovery acts on.
+            finish_reason=(
+                incomplete.get("reason") if isinstance(incomplete, dict) else None
+            )
+            or data.get("status"),
+            provider_request_id=data.get("id"),
+            raw=data,
+            raw_body=response.content,
+            reasoning_state=_reasoning_state(
+                self.config.id,
+                model,
+                {"reasoning_items": reasoning_items} if reasoning_items else {},
+            ),
+        )
+
+    async def health(self) -> ProviderHealth:
+        try:
+            async with self._client(self._headers()) as client:
+                response = await client.get(self._path("/v1/models"))
+            if response.is_error:
+                raise _safe_error(response)
+            models = [
+                item["id"]
+                for item in response.json().get("data", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ]
+            return ProviderHealth(
+                provider_id=self.config.id, healthy=True, models=models
+            )
+        except Exception as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_006",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            return ProviderHealth(
+                provider_id=self.config.id, healthy=False, detail=str(exc)
+            )
+
+
+_WIRE_TOOL_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _wire_tool_names(request: ModelRequest) -> dict[str, str]:
+    """Map Nebula tool names to names every vendor accepts.
+
+    Nebula names may contain dots (``tool_output.search``); OpenAI (Chat
+    Completions and Responses), Anthropic and Bedrock accept only
+    ``[a-zA-Z0-9_-]{1,64}``. The mapping is derived from the request alone, so
+    responses and replayed history decode identically.
+    """
+
+    names = sorted(
+        {tool.name for tool in request.tools}
+        | {result.name for result in request.tool_results}
+    )
+    mapping: dict[str, str] = {}
+    used: set[str] = {name for name in names if _WIRE_TOOL_NAME.match(name)}
+    for name in names:
+        if _WIRE_TOOL_NAME.match(name):
+            mapping[name] = name
+            continue
+        wire = re.sub(r"[^a-zA-Z0-9_-]", "_", name)[:64] or "tool"
+        if wire in used:
+            digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+            wire = f"{wire[:55]}_{digest}"
+        used.add(wire)
+        mapping[name] = wire
+    return mapping
+
+
+def _decode_tool_name(request: ModelRequest, wire: Any) -> str:
+    """The Nebula tool a provider's call names, as near as Core can tell.
+
+    Vendors see wire names, so those decode to the tool. Models also mis-case
+    a declared name, pad it with spaces or keep OpenAI's ``functions.``
+    namespace in front of it; opencode repairs a mis-cased name the same way.
+    A name that matches no declared or replayed tool is returned as sent.
+    """
+
+    sent = wire.strip() if isinstance(wire, str) else ""
+    names = _wire_tool_names(request)
+    declared = {wire_name: name for name, wire_name in names.items()}
+    declared.update({name: name for name in names})
+    candidates = (sent, sent.removeprefix("functions."))
+    for candidate in candidates:
+        if candidate in declared:
+            return declared[candidate]
+    folded = {key.casefold(): name for key, name in declared.items()}
+    for candidate in candidates:
+        match = folded.get(candidate.casefold())
+        if match is not None:
+            return match
+    return sent
+
+
+def _adapter_response(request: ModelRequest, **fields: Any) -> ModelResponse:
+    """An adapter's response to ``request``.
+
+    Tool calls recovered from the reply's text decode against the request's
+    tools, the same as the calls the route reported properly.
+    """
+
+    return ModelResponse.model_validate(fields, context={_RESPONSE_REQUEST: request})
+
+
+def _tool_call(
+    request: ModelRequest,
+    *,
+    call_id: Any,
+    name: Any,
+    arguments: Any,
+    diagnostic_metadata: dict[str, Any] | None = None,
+    provider_metadata: dict[str, Any] | None = None,
+) -> ToolCall:
+    """Read one provider tool call; a defect in it never fails the response.
+
+    A missing id gets one Core mints, as the AI SDK does (``toolCall.id ||
+    generateId()``), and the name is decoded against the declared tools. A
+    call that still cannot be read, because it names no usable tool or its
+    arguments are not a JSON object, comes back with ``invalid_reason`` and
+    no arguments: the caller answers it with the reason, the way Codex
+    answers "failed to parse function arguments", and never runs it. The
+    other calls of the response are unaffected.
+    """
+
+    metadata = dict(diagnostic_metadata or {})
+    identity = (
+        str(call_id)
+        if isinstance(call_id, (str, int)) and not isinstance(call_id, bool)
+        else ""
+    )
+    if not identity or len(identity) > _TOOL_CALL_ID_MAX_LENGTH:
+        identity = f"call_{uuid.uuid4().hex}"
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.tool_call.missing_id",
+            "A provider returned a tool call without a usable id; Core gave it one.",
+            outcome="fallback",
+            stage="providers",
+            retryable=False,
+            metadata=metadata,
+        )
+    decoded = _decode_tool_name(request, name)
+    usable_name = re.fullmatch(_TOOL_CALL_NAME, decoded) is not None
+    reasons: list[str] = []
+    if not decoded:
+        reasons.append("the call did not name a tool")
+    elif not usable_name:
+        reasons.append(f"{decoded[:64]!r} is not the name of a tool")
+    if reasons:
+        record_diagnostic(
+            "warning",
+            "providers",
+            "providers.tool_call.invalid_name",
+            "A provider returned a tool call whose name is not a tool name; "
+            "Core returned it to the model instead of failing the response.",
+            outcome="fallback",
+            stage="providers",
+            retryable=False,
+            metadata={**metadata, "name_length": len(decoded)},
+        )
+    try:
+        parsed = _arguments(
+            arguments, diagnostic_metadata={**metadata, "tool_id": decoded}
+        )
+    except ProviderError as exc:  # diagnostic-expected: the model is told why instead
+        parsed = {}
+        reasons.append(
+            f"arguments were not valid JSON: {exc.__cause__}"
+            if isinstance(exc.__cause__, json.JSONDecodeError)
+            else "arguments were not a JSON object"
+        )
+    if reasons:
+        return ToolCall(
+            id=identity,
+            name=decoded if usable_name else INVALID_TOOL_CALL_NAME,
+            arguments={},
+            invalid_reason="; ".join(reasons),
+            provider_metadata=provider_metadata,
+        )
+    return ToolCall(
+        id=identity,
+        name=decoded,
+        arguments=parsed,
+        provider_metadata=provider_metadata,
+    )
+
+
+# Anthropic and Bedrock reject replayed tool blocks in a request that declares
+# no tools. LiteLLM (add_dummy_tool) and opencode (_noop) declare a placeholder
+# for the same reason; declaring the replayed names keeps the history's calls
+# to declared functions.
+_REPLAYED_TOOL_DESCRIPTION = (
+    "Called earlier in this conversation. Not available to call in this request."
+)
+
+
+def _replayed_wire_names(
+    request: ModelRequest, wire_names: dict[str, str]
+) -> list[str]:
+    return sorted(
+        {wire_names.get(result.name, result.name) for result in request.tool_results}
+    )
+
+
+# Mistral AI model families, served by Mistral itself or by any runtime that
+# applies Mistral's chat template (vLLM, OpenRouter, a gateway).
+_MISTRAL_MODEL = re.compile(
+    r"mistral|mixtral|codestral|devstral|pixtral|magistral|ministral|voxtral",
+    re.IGNORECASE,
+)
+_MISTRAL_TOOL_CALL_ID = re.compile(r"[a-zA-Z0-9]{9}")
+_BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _mistral_tool_call_id(call_id: str) -> str:
+    """A tool-call id Mistral accepts: exactly nine ``[a-zA-Z0-9]`` characters.
+
+    Replayed ids can come from DSML recovery or from another provider after a
+    mid-chat model switch. An id Mistral issued is kept; any other maps to a
+    digest of itself, so the call and its result still pair up and every
+    request of a turn replays the same id.
+    """
+
+    if _MISTRAL_TOOL_CALL_ID.fullmatch(call_id):
+        return call_id
+    number = int.from_bytes(hashlib.sha256(call_id.encode("utf-8")).digest(), "big")
+    characters = []
+    for _ in range(9):
+        number, index = divmod(number, 62)
+        characters.append(_BASE62[index])
+    return "".join(characters)
+
+
+def _mistral_tool_call_ids(messages: list[dict[str, Any]]) -> None:
+    for message in messages:
+        for call in message.get("tool_calls") or ():
+            if isinstance(call, dict) and isinstance(call.get("id"), str):
+                call["id"] = _mistral_tool_call_id(call["id"])
+        if message.get("role") == "tool" and isinstance(
+            message.get("tool_call_id"), str
+        ):
+            message["tool_call_id"] = _mistral_tool_call_id(message["tool_call_id"])
+
+
+def _first_choice(data: dict[str, Any]) -> dict[str, Any]:
+    """``choices[0]``, or nothing when a server sends null or a non-object."""
+
+    choices = data.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    return first if isinstance(first, dict) else {}
+
+
+# Vendor finish reasons that end a reply early. DeepSeek reports an inference
+# fleet out of capacity, and Z.ai an internal network failure, as a finish
+# reason on an HTTP 200 (Vercel AI ``map-deepseek-finish-reason.ts`` and
+# ``zai-chat-language-model.ts`` map both to "error"). Resending can succeed.
+_TRANSIENT_FINISH_REASONS = frozenset(
+    {"error", "insufficient_system_resource", "network_error"}
+)
+# Z.ai names its content filter ``sensitive``.
+_FILTER_FINISH_REASONS = frozenset({"content_filter", "sensitive"})
+# Z.ai stops at the model's context window with this reason; it is an
+# overflow (pi-mono ``overflow.ts``), so compaction recovery must run.
+_CONTEXT_FINISH_REASONS = frozenset({"model_context_window_exceeded"})
+_FINISH_REASON_WORD = re.compile(r"[^a-z0-9]+")
+
+
+def _finish_reason_failure(choice: dict[str, Any]) -> ProviderError | None:
+    """A finish reason that ends the reply as a failure, not an answer.
+
+    Besides the named values, only a reason that plainly names an error
+    (``server_error``, ``upstream_error``) is a failure; any other value a
+    runtime invents (``end``, ``eos``, ``end_turn``) is left to the caller,
+    as an ordinary stop or ``length`` is.
+    """
+
+    raw = choice.get("finish_reason")
+    reason = raw.casefold() if isinstance(raw, str) else ""
+    if reason in _TRANSIENT_FINISH_REASONS or "error" in _FINISH_REASON_WORD.split(
+        reason
+    ):
+        # OpenRouter may name the cause in the choice's own ``error`` object.
+        error = choice.get("error")
+        detail = _error_detail({"error": error})[0] if error else None
+        named = "" if reason == "error" else f" ({raw})"
+        return ProviderOverloadedError(
+            f"provider ended the reply with an error{named}"
+            + (f": {detail}" if detail else "")
+        )
+    if reason in _CONTEXT_FINISH_REASONS:
+        return ProviderContextLengthError(
+            f"provider stopped the reply at the model's context window ({raw})"
+        )
+    if reason in _FILTER_FINISH_REASONS:
+        verdicts = choice.get("content_filter_results")
+        flagged = (
+            sorted(
+                str(category)
+                for category, verdict in verdicts.items()
+                if isinstance(verdict, dict) and verdict.get("filtered")
+            )
+            if isinstance(verdicts, dict)
+            else []
+        )
+        # A refusal is reported as it is, not as an unfinished answer.
+        return ProviderRefusalError(
+            "content filter stopped the reply"
+            + ("" if reason == "content_filter" else f" ({raw})")
+            + (f" (filtered: {', '.join(flagged)})" if flagged else "")
+        )
+    return None
+
+
+def _chat_completion_failure(data: dict[str, Any]) -> ProviderError | None:
+    """The failure a Chat Completions HTTP 200 body reports, if any.
+
+    OpenRouter and other gateways answer an upstream failure with a 200 whose
+    body is ``{"error": {...}}``; read as a reply it is an empty answer.
+    """
+
+    failure = _stream_error_frame(data)
+    if failure is not None:
+        detail, _code = _error_detail(data)
+        # Keep the classified type and status; only the wording differs.
+        failure.args = (
+            "provider returned an error instead of a reply"
+            + (f": {detail}" if detail else ""),
+        )
+        return failure
+    return _finish_reason_failure(_first_choice(data))
+
+
+def _chat_completion_body_failure(response: httpx.Response) -> ProviderError | None:
+    """Retry inspector: a transient failure inside a 200 is resent like a 5xx."""
+
+    # A cheap pre-check before parsing: an error object, or a transient
+    # finish reason (``"error"``, ``"network_error"``, DeepSeek's
+    # ``"insufficient_system_resource"``).
+    if b'error"' not in response.content and (
+        b'"insufficient_system_resource"' not in response.content
+    ):
+        return None
+    try:
+        data = response.json()
+    except ValueError:  # diagnostic-expected: complete() reports the unreadable body
+        return None
+    return _chat_completion_failure(data) if isinstance(data, dict) else None
+
+
+def _merge_function_call_delta(call: dict[str, str], delta: Any) -> None:
+    """Fold one legacy ``function_call`` delta into the single call it builds."""
+
+    if not isinstance(delta, dict):
+        return
+    call["name"] = call["name"] or str(delta.get("name") or "")
+    arguments = delta.get("arguments")
+    if isinstance(arguments, dict):
+        # An object is the whole arguments so far, not the next piece.
+        call["arguments"] = json.dumps(arguments)
+    else:
+        call["arguments"] += str(arguments or "")
+
+
+def _legacy_function_call(
+    request: ModelRequest, function: dict[str, Any], metadata: dict[str, Any]
+) -> ToolCall:
+    """Read a legacy ``function_call`` as the single tool call it is.
+
+    It carries no id, so one is minted; the call is otherwise treated exactly
+    like a ``tool_calls`` entry.
+    """
+
+    return _tool_call(
+        request,
+        call_id=f"call_{uuid.uuid4().hex[:24]}",
+        name=function.get("name"),
+        arguments=function.get("arguments"),
+        diagnostic_metadata=metadata,
+    )
+
+
+def json_schema_instruction(schema: dict[str, Any]) -> str:
+    """The instruction that carries a response schema where the wire cannot."""
+
+    return "Return JSON matching this schema: " + json.dumps(
+        schema, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+# Flavors that serve OpenAI's own models and honour its ``strict`` contract.
+_OPENAI_STRICT_FLAVORS = frozenset(
+    {
+        ProviderFlavor.OPENAI,
+        ProviderFlavor.AZURE_OPENAI,
+        ProviderFlavor.MICROSOFT_FOUNDRY,
+    }
+)
+# DeepSeek's and Z.ai's (and BigModel's) chat APIs take ``json_object`` but
+# not ``json_schema`` structured output.
+_JSON_OBJECT_ONLY_HOSTS = ("deepseek.com", "z.ai", "bigmodel.cn")
+
+
+class OpenAICompatibleProvider(ModelProvider):
+    """Adapter for Chat Completions-compatible hosted and local runtimes."""
+
+    def _headers(self) -> dict[str, str]:
+        return self._bearer_or_key_headers()
+
+    def _strict_contract(self, model: str) -> bool:
+        """Whether this route takes OpenAI's ``strict`` schema contract.
+
+        Strict mode is OpenAI's: OpenRouter's own SDK never sends it on tools,
+        and pi-mono sends it only where a provider opts in. DeepSeek's strict
+        mode is beta-only and needs every tool strict, which Nebula's routing
+        (``tool_catalog.call`` is never strict) is not.
+        """
+
+        if self.config.flavor in _OPENAI_STRICT_FLAVORS:
+            return True
+        return self.config.flavor == ProviderFlavor.OPENROUTER and (
+            model.casefold().startswith("openai/")
+        )
+
+    def _json_object_only(self, model: str) -> bool:
+        """Whether structured output must be JSON mode instead of a schema.
+
+        DeepSeek and Z.ai reject ``json_schema`` ("This response_format type
+        is unavailable now"); Vercel AI's DeepSeek provider sends
+        ``json_object`` with the schema in a system message instead. An
+        OpenRouter model whose catalog entry lacks ``structured_outputs`` is
+        treated the same; one with no entry keeps the schema.
+        """
+
+        if self.config.flavor == ProviderFlavor.OPENROUTER:
+            supported = self.config.model_parameters.get(model) or []
+            return bool(supported) and "structured_outputs" not in supported
+        if self.config.flavor == ProviderFlavor.DEEPSEEK:
+            return True
+        return _host_in(self.config.base_url, _JSON_OBJECT_ONLY_HOSTS)
+
+    def _payload(self, request: ModelRequest, model: str) -> dict[str, Any]:
+        vllm_grammar = self.config.flavor == ProviderFlavor.VLLM
+        strict = self._strict_contract(model)
+        json_object = bool(request.response_schema) and self._json_object_only(model)
+        wire_names = _wire_tool_names(request)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [_openai_chat_message(message) for message in request.messages],
+        }
+        conversation_end = len(payload["messages"])
+        # Each routing response goes back as the one message that issued its
+        # calls; its reasoning is attached per flavor once the payload is built.
+        replayed: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+        for batch, state in _replayed_batches(request, self.config.id, model):
+            assistant: dict[str, Any] = {
+                "role": "assistant",
+                "content": batch[0].response_text,
+                "tool_calls": [],
+            }
+            for result in batch:
+                call: dict[str, Any] = {
+                    "id": result.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": wire_names.get(result.name, result.name),
+                        "arguments": json.dumps(result.arguments, sort_keys=True),
+                    },
+                }
+                extra = _call_metadata(result, state, "extra_content")
+                if isinstance(extra, dict):
+                    # Gemini's OpenAI-compatible endpoint signs calls here.
+                    call["extra_content"] = extra
+                assistant["tool_calls"].append(call)
+            payload["messages"].append(assistant)
+            replayed.append((assistant, state))
+            payload["messages"].extend(
+                {
+                    "role": "tool",
+                    "tool_call_id": result.call_id,
+                    "content": _result_text(result),
+                }
+                for result in batch
+            )
+            attachments = [part for result in batch for part in result.attachments]
+            if attachments:
+                # Tool messages carry text only, so what a tool showed the
+                # model follows the batch's results, not the calls' request.
+                payload["messages"].append(
+                    _openai_chat_message(ModelMessage(role="user", content=attachments))
+                )
+        instructions = request.instructions
+        if json_object and request.response_schema:
+            # JSON mode has no schema field, so the schema travels with the
+            # instructions (Vercel AI's DeepSeek provider does the same).
+            schema_text = json_schema_instruction(request.response_schema)
+            instructions = (
+                f"{instructions}\n\n{schema_text}" if instructions else schema_text
+            )
+        if instructions:
+            payload["messages"].insert(0, {"role": "system", "content": instructions})
+            conversation_end += 1
+        openrouter = self.config.flavor == ProviderFlavor.OPENROUTER
+        if request.max_output_tokens:
+            # OpenAI's reasoning families answer 400 to max_tokens ("use
+            # max_completion_tokens instead"), directly and via Azure/Foundry
+            # or a gateway. OpenRouter normalizes max_tokens, the name its
+            # routes advertise, and translates it for every upstream.
+            ceiling = (
+                "max_completion_tokens"
+                if not openrouter and _openai_reasoning_model(model)
+                else "max_tokens"
+            )
+            payload[ceiling] = request.max_output_tokens
+        if request.temperature is not None and not _openai_reasoning_model(model):
+            payload["temperature"] = request.temperature
+        if not openrouter:
+            payload.update(_chat_reasoning_controls(self.config, request, model))
+        if request.tools:
+            if openrouter:
+                # Prevent OpenRouter from selecting an endpoint that drops a
+                # parameter Nebula relies on for its verified tool contract.
+                # No OpenRouter route advertises parallel_tool_calls, so
+                # sending it with require_parameters matches no endpoint. A
+                # route is free to batch calls; callers accept a batch and
+                # execute it one call at a time.
+                payload["provider"] = {"require_parameters": True}
+            else:
+                payload["parallel_tool_calls"] = request.parallel_tool_calls
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": wire_names.get(tool.name, tool.name),
+                        "description": tool.description,
+                        "parameters": (
+                            _vllm_grammar_schema(tool.input_schema)
+                            if vllm_grammar
+                            else tool.input_schema
+                        ),
+                        # Strict mode is a request-level contract: one schema
+                        # it rejects fails every tool in the call.
+                        **(
+                            {
+                                "strict": tool.strict
+                                and _openai_strict_schema(tool.input_schema)
+                            }
+                            if strict
+                            else {}
+                        ),
+                    },
+                }
+                for tool in request.tools
+            ]
+            if (
+                request.tool_choice == ToolChoice.REQUIRED
+                and rejects_forced_tool_choice(model)
+            ):
+                # Fable 5.1 and Mythos refuse a forced choice wherever they
+                # are served, and OpenRouter forwards "required" to them as
+                # Anthropic's "any" (#486 gates the native adapters the same
+                # way). The caller still validates the call.
+                payload["tool_choice"] = ToolChoice.AUTO.value
+            elif request.tool_choice in {ToolChoice.REQUIRED, ToolChoice.NONE}:
+                payload["tool_choice"] = request.tool_choice.value
+        if json_object:
+            payload["response_format"] = {"type": "json_object"}
+        elif request.response_schema:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "nebula_response",
+                    # A schema strict mode rejects (optional properties,
+                    # defaults) fails the request; callers validate the reply.
+                    **(
+                        {"strict": _openai_strict_schema(request.response_schema)}
+                        if strict
+                        else {}
+                    ),
+                    "schema": (
+                        _vllm_grammar_schema(request.response_schema)
+                        if vllm_grammar
+                        else request.response_schema
+                    ),
+                },
+            }
+        if openrouter:
+            # OpenRouter uses this as a sticky-routing key. A Nebula chat turn
+            # can span several tool and synthesis requests, so keep those
+            # requests on one upstream route instead of letting each hop choose
+            # a different provider implementation.
+            session_id = request.metadata.get("chat_session_id")
+            if session_id:
+                payload["session_id"] = session_id
+            allowed = self.openrouter_allowed_providers
+            if allowed:
+                # Operator-selected upstream providers: never route elsewhere.
+                payload["provider"] = {**payload.get("provider", {}), "only": allowed}
+            if self.openrouter_require_zdr:
+                payload["provider"] = {**payload.get("provider", {}), "zdr": True}
+            payload["reasoning"] = _openrouter_reasoning(
+                request,
+                set(self.config.model_parameters.get(model, ())),
+                mandatory=model in self.config.reasoning_mandatory_models
+                or _claude_always_thinks(model),
+            )
+            # OpenRouter compresses the middle of an oversized prompt by default
+            # on endpoints of 8K or less. Nebula sizes its own context and
+            # recovers from a rejected request, so take the error over silent
+            # truncation of material the caller believes was sent.
+            payload["plugins"] = [{"id": "context-compression", "enabled": False}]
+            if request.tools:
+                # With require_parameters, any optional parameter the exact
+                # model does not advertise leaves no eligible endpoint.
+                supported = set(self.config.model_parameters.get(model, ()))
+                for optional in ("reasoning", "temperature"):
+                    if optional in payload and optional not in supported:
+                        payload.pop(optional)
+                if supported:
+                    # The tool contract's own controls and the ceiling are
+                    # dropped only when the catalog says the route lacks them.
+                    # A routing step that returns no call is recoverable; a
+                    # request no endpoint accepts (404) fails the turn.
+                    for optional in ("tool_choice", "max_tokens"):
+                        if optional in payload and optional not in supported:
+                            payload.pop(optional)
+                    # A json_schema response_format is advertised as
+                    # structured_outputs alongside response_format; JSON mode
+                    # needs response_format alone.
+                    structured = (
+                        {"response_format"}
+                        if json_object
+                        else {"response_format", "structured_outputs"}
+                    )
+                    if "response_format" in payload and not structured <= supported:
+                        payload.pop("response_format")
+        _replay_reasoning(payload, replayed, self.config.flavor, model)
+        if self.config.flavor == ProviderFlavor.MISTRAL or _MISTRAL_MODEL.search(model):
+            _mistral_tool_call_ids(payload["messages"])
+        if _openrouter_caches(self.config, model):
+            _mark_openrouter_cache(payload, request, conversation_end)
+        cache_key = _prompt_cache_key(self.config, request)
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
+        return payload
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        model = self.require(request)
+        payload = self._payload(request, model)
+        # The whole generation arrives as one response, as it does for the
+        # native adapters, so it gets their long read timeout.
+        async with self._client(
+            self._headers(), timeout=_native_http_timeout(self.config)
+        ) as client:
+            response = await self._post(
+                client,
+                self._path("/v1/chat/completions"),
+                payload,
+                operation="chat_completions",
+                inspect=_chat_completion_body_failure,
+            )
+            retry = _refused_reasoning_off_retry(payload, response)
+            if retry is not None:
+                _record_reasoning_off_refused(self.config, model)
+                response = await self._post(
+                    client,
+                    self._path("/v1/chat/completions"),
+                    retry,
+                    operation="chat_completions",
+                    inspect=_chat_completion_body_failure,
+                )
+        if response.is_error:
+            raise _safe_error(response)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            # A captive portal or a wrong base URL answers 200 with HTML.
+            content_type = response.headers.get("content-type", "").split(";")[0]
+            raise ProviderResponseError(
+                "provider returned a response that is not JSON (content-type "
+                f"{content_type.strip()[:100] or 'none'})"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ProviderResponseError(
+                "provider returned a response that is not a JSON object"
+            )
+        failure = _chat_completion_failure(data)
+        if failure is not None:
+            raise failure
+        choice = _first_choice(data)
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            message = {}
+        # Servers that serialize absent lists write ``"tool_calls": null``.
+        raw_calls = message.get("tool_calls")
+        items = (
+            [item for item in raw_calls if isinstance(item, dict)]
+            if isinstance(raw_calls, list)
+            else []
+        )
+        calls: list[ToolCall] = []
+        for item in items:
+            function = item.get("function")
+            if not isinstance(function, dict):
+                function = {}
+            extra = item.get("extra_content")
+            calls.append(
+                _tool_call(
+                    request,
+                    call_id=item.get("id"),
+                    name=function.get("name"),
+                    arguments=function.get("arguments"),
+                    diagnostic_metadata={
+                        "adapter": self.config.flavor.value,
+                        "model_id": data.get("model") or model,
+                        "provider": self.config.id,
+                        "status": choice.get("finish_reason"),
+                        "vendor_request_id": data.get("id"),
+                    },
+                    provider_metadata=(
+                        {"extra_content": extra} if isinstance(extra, dict) else None
+                    ),
+                )
+            )
+        legacy = message.get("function_call")
+        if not items and isinstance(legacy, dict) and legacy.get("name"):
+            # Only without tool_calls: a server that mirrors one call into
+            # both fields must not have it run twice.
+            calls.append(
+                _legacy_function_call(
+                    request,
+                    legacy,
+                    {
+                        "adapter": self.config.flavor.value,
+                        "model_id": data.get("model") or model,
+                        "provider": self.config.id,
+                        "status": choice.get("finish_reason"),
+                        "vendor_request_id": data.get("id"),
+                    },
+                )
+            )
+        routed_reasoning = _openai_message_reasoning(message).strip()
+        # A runtime without a reasoning parser leaves the thought in the reply.
+        inline_reasoning, text = split_reply(
+            _openai_message_content(message) or _openai_refusal(message),
+            template_opened=not routed_reasoning and template_opens_thinking(model),
+        )
+        return _adapter_response(
+            request,
+            provider_id=self.config.id,
+            model=data.get("model") or model,
+            text=text.strip(),
+            reasoning="\n\n".join(
+                part for part in (routed_reasoning, inline_reasoning.strip()) if part
+            ),
+            tool_calls=calls,
+            usage=_openai_usage(
+                data.get("usage"),
+                billed=self.config.flavor == ProviderFlavor.OPENROUTER,
+            ),
+            finish_reason=choice.get("finish_reason"),
+            provider_request_id=data.get("id"),
+            raw=data,
+            raw_body=response.content,
+            reasoning_state=_reasoning_state(
+                self.config.id,
+                model,
+                _openai_reasoning_fields(
+                    message,
+                    openrouter=self.config.flavor == ProviderFlavor.OPENROUTER,
+                ),
+                calls,
+            ),
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        async for event in _stream_openai_compatible(self, request):
+            yield event
+
+    async def health(self) -> ProviderHealth:
+        if self.config.flavor == ProviderFlavor.OPENROUTER:
+            return await self._openrouter_health()
+        try:
+            async with self._client(self._headers()) as client:
+                response = await _send_with_retry(
+                    self.config,
+                    lambda: client.get(self._path("/v1/models")),
+                    operation="model_discovery",
+                )
+            if response.is_error:
+                raise _safe_error(response)
+            models = [
+                item["id"]
+                for item in response.json().get("data", [])
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ]
+            return ProviderHealth(
+                provider_id=self.config.id, healthy=True, models=models
+            )
+        except Exception as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_007",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            return ProviderHealth(
+                provider_id=self.config.id, healthy=False, detail=str(exc)
+            )
+
+    async def _openrouter_health(self) -> ProviderHealth:
+        """Use account visibility without ever substituting the public catalog."""
+        try:
+            async with asyncio.timeout(30):
+                async with self._client(self._headers()) as client:
+                    key_response = await _send_with_retry(
+                        self.config,
+                        lambda: client.get(self._path("/v1/key"), timeout=10.0),
+                        operation="openrouter_credential_verification",
+                        retry_transient_statuses=False,
+                    )
+                    if key_response.is_error:
+                        return ProviderHealth(
+                            provider_id=self.config.id,
+                            healthy=False,
+                            credential_verified=False,
+                            detail=(
+                                f"OpenRouter credential verification failed (HTTP {key_response.status_code}). "
+                                "Check the credential, then retry."
+                            ),
+                        )
+                    key_payload = key_response.json()
+                    key_data = (
+                        key_payload.get("data")
+                        if isinstance(key_payload, dict)
+                        else None
+                    )
+                    if not isinstance(key_data, dict):
+                        raise ValueError("Invalid OpenRouter key response")
+                    response = await _send_with_retry(
+                        self.config,
+                        lambda: client.get(self._path("/v1/models/user"), timeout=10.0),
+                        operation="openrouter_model_discovery",
+                        retry_transient_statuses=False,
+                    )
+                    directory: httpx.Response | None = None
+                    directory_failure: str | None = None
+                    try:
+                        if not response.is_error:
+                            directory = await client.get(
+                                self._path("/v1/providers"), timeout=10.0
+                            )
+                    except httpx.HTTPError:  # diagnostic-expected: reported below when an allowlist needs the directory; routing is unaffected
+                        directory_failure = "could not be reached"
+                    upstream: list[UpstreamProvider] = []
+                    try:
+                        if directory is not None and directory.is_error:
+                            directory_failure = f"failed (HTTP {directory.status_code})"
+                        elif directory is not None:
+                            upstream = openrouter_upstream_providers(directory.json())
+                    except ValueError:  # diagnostic-expected: reported below when an allowlist needs the directory; routing is unaffected
+                        directory_failure = "was unreadable"
+                    zdr_routes = (
+                        await self._openrouter_zdr_endpoint_tags(client)
+                        if not response.is_error and self.openrouter_require_zdr
+                        else None
+                    )
+                    served: set[str] | None = None
+                    if (
+                        not response.is_error
+                        and self.openrouter_allowed_providers
+                        and not self.openrouter_require_zdr
+                        and directory_failure is None
+                    ):
+                        served = await self._openrouter_models_served_by(
+                            client, {item.slug for item in upstream}
+                        )
+                    alias_targets: dict[str, str] = {}
+                    try:
+                        if not response.is_error:
+                            alias_targets = await self._openrouter_alias_targets(
+                                client, response.json()
+                            )
+                    except (
+                        httpx.HTTPError,
+                        ValueError,
+                    ):  # diagnostic-expected: aliases keep the conservative cap; routing is unaffected
+                        alias_targets = {}
+                if response.is_error:
+                    return ProviderHealth(
+                        provider_id=self.config.id,
+                        healthy=False,
+                        credential_verified=True,
+                        catalog_source="openrouter:/models/user",
+                        detail=(
+                            f"OpenRouter model discovery failed (HTTP {response.status_code}). "
+                            "Check credentials and account access, then refresh."
+                        ),
+                    )
+                if directory_failure is not None and self.openrouter_allowed_providers:
+                    # An empty directory would filter out every model and blame
+                    # the operator's allowlist; fail closed like /models/user.
+                    return ProviderHealth(
+                        provider_id=self.config.id,
+                        healthy=False,
+                        credential_verified=True,
+                        catalog_source="openrouter:/models/user",
+                        detail=(
+                            f"The OpenRouter provider directory {directory_failure}, "
+                            "so the upstream provider allowlist could not be applied. "
+                            "The model list was left unchanged; refresh to retry."
+                        ),
+                    )
+                descriptors = openrouter_models(response.json())
+                # The account catalog omits alias_target, so aliases arrive without
+                # the one field endpoint discovery needs.
+                descriptors = [
+                    item.model_copy(update={"alias_target": alias_targets[item.id]})
+                    if item.alias_target is None and item.id in alias_targets
+                    else item
+                    for item in descriptors
+                ]
+                detail = "Account model catalog loaded; inference is not yet verified."
+                if zdr_routes is not None:
+                    allowed = set(self.openrouter_allowed_providers)
+                    eligible_models = {
+                        model_id
+                        for model_id, tag in zdr_routes
+                        if not allowed or tag.split("/", 1)[0] in allowed
+                    }
+                    descriptors = [
+                        item
+                        for item in descriptors
+                        if item.id in eligible_models
+                        or item.alias_target in eligible_models
+                    ]
+                    detail = (
+                        "Showing account models with ZDR endpoints"
+                        + (" at the allowed upstream providers" if allowed else "")
+                        + "; inference is not yet verified."
+                    )
+                elif served is not None:
+                    descriptors = [item for item in descriptors if item.id in served]
+                    detail = (
+                        "Showing only models served by the allowed upstream providers; "
+                        "inference is not yet verified."
+                    )
+            return ProviderHealth(
+                provider_id=self.config.id,
+                healthy=True,
+                models=[model.id for model in descriptors],
+                model_descriptors=descriptors,
+                upstream_providers=upstream,
+                credential_verified=True,
+                catalog_source="openrouter:/models/user",
+                key_expires_at=(
+                    key_data.get("expires_at")
+                    if isinstance(key_data.get("expires_at"), str)
+                    else None
+                ),
+                key_limit_remaining=(
+                    float(key_data["limit_remaining"])
+                    if isinstance(key_data.get("limit_remaining"), (int, float))
+                    and not isinstance(key_data.get("limit_remaining"), bool)
+                    else None
+                ),
+                detail=detail,
+            )
+        except (
+            httpx.HTTPError,
+            ProviderError,
+            TimeoutError,
+            ValueError,
+        ):  # diagnostic-expected: failure is reported as unhealthy; raw text may contain credentials
+            # Transport and upstream payload exceptions may contain credentials;
+            # an exhausted connection retry arrives as a ProviderError.
+            return ProviderHealth(
+                provider_id=self.config.id,
+                healthy=False,
+                detail=(
+                    (
+                        "OpenRouter model or ZDR endpoint discovery failed after bounded retries. "
+                        if self.openrouter_require_zdr
+                        else "OpenRouter model discovery failed after bounded retries. "
+                    )
+                    + "Check the connection and refresh."
+                ),
+            )
+
+    async def _openrouter_public_catalog(
+        self, client: httpx.AsyncClient, params: dict[str, str]
+    ) -> list[ModelDescriptor]:
+        """Page the public catalog. Membership still comes from /models/user."""
+
+        models: list[ModelDescriptor] = []
+        for _page in range(20):
+            response = await client.get(
+                self._path("/v1/models"), params=params, timeout=10.0
+            )
+            response.raise_for_status()
+            payload = response.json()
+            models.extend(openrouter_models(payload))
+            links = payload.get("links") if isinstance(payload, dict) else None
+            following = links.get("next") if isinstance(links, dict) else None
+            offset = (
+                httpx.URL(following).params.get("offset")
+                if isinstance(following, str)
+                else None
+            )
+            if not offset:
+                break
+            params = {**params, "offset": offset}
+        return models
+
+    async def _openrouter_zdr_endpoint_tags(
+        self, client: httpx.AsyncClient
+    ) -> set[tuple[str, str]]:
+        """Fetch exact model and endpoint tags eligible for provider-side ZDR."""
+
+        response = await client.get(self._path("/v1/endpoints/zdr"), timeout=10.0)
+        if response.is_error:
+            raise ProviderError(
+                f"OpenRouter ZDR endpoint discovery failed (HTTP {response.status_code})"
+            )
+        payload = response.json()
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not rows or len(rows) > 10_000:
+            raise ValueError("Invalid OpenRouter ZDR endpoint directory")
+        routes = {
+            (row["model_id"], row["tag"])
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("model_id"), str)
+            and isinstance(row.get("tag"), str)
+        }
+        if not routes:
+            raise ValueError("Invalid OpenRouter ZDR endpoint directory")
+        return routes
+
+    async def _openrouter_models_served_by(
+        self, client: httpx.AsyncClient, directory: set[str]
+    ) -> set[str]:
+        """Model ids at least one allowed upstream provider serves.
+
+        OpenRouter ignores unknown slugs in the `providers` filter and returns the
+        whole catalog when none are known, so only directory slugs are sent and an
+        empty match yields no models instead of every model.
+        """
+
+        known = [
+            slug for slug in self.openrouter_allowed_providers if slug in directory
+        ]
+        if not known:
+            return set()
+        params = {"providers": ",".join(known)}
+        return {
+            item.id for item in await self._openrouter_public_catalog(client, params)
+        }
+
+    async def _openrouter_alias_targets(
+        self, client: httpx.AsyncClient, account_payload: Any
+    ) -> dict[str, str]:
+        """Exact model each alias in the account catalog redirects to.
+
+        `/models/user` describes aliases without `alias_target`, so the model an
+        alias serves is only published in the public catalog. Nothing here decides
+        which models the operator may use; it fills one missing field on models
+        the account catalog already returned.
+        """
+
+        data = (
+            account_payload.get("data") if isinstance(account_payload, dict) else None
+        )
+        aliases = {
+            item["id"]
+            for item in (data if isinstance(data, list) else [])
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item["id"].startswith("~")
+        }
+        if not aliases:
+            return {}
+        return {
+            item.id: item.alias_target
+            for item in await self._openrouter_public_catalog(client, {})
+            if item.id in aliases and item.alias_target
+        }
+
+    @property
+    def openrouter_allowed_providers(self) -> list[str]:
+        """Upstream provider slugs the operator allows (empty means any)."""
+
+        raw = self.config.options.get("openrouter_providers")
+        if not isinstance(raw, list):
+            return []
+        return list(
+            dict.fromkeys(
+                item.strip().lower()
+                for item in raw
+                if isinstance(item, str) and item.strip()
+            )
+        )
+
+    @property
+    def openrouter_require_zdr(self) -> bool:
+        """Provider-side ZDR is opt-in for each OpenRouter profile."""
+
+        return self.config.options.get("openrouter_zdr") is True
+
+    async def openrouter_route_limits(self, model: str) -> list[ModelRouteDescriptor]:
+        """Load the exact automatic-routing endpoint set for one model."""
+
+        if self.config.flavor != ProviderFlavor.OPENROUTER:
+            raise UnsupportedCapability(
+                "route limits are available only for OpenRouter"
+            )
+        author, separator, slug = model.partition("/")
+        if not separator or not author or not slug or len(model) > 500:
+            raise ProviderError(
+                "OpenRouter route discovery requires an exact model slug"
+            )
+        endpoint = (
+            f"/v1/models/{quote(author, safe='')}/{quote(slug, safe=':')}/endpoints"
+        )
+        try:
+            async with asyncio.timeout(15):
+                async with self._client(self._headers()) as client:
+                    response = await client.get(self._path(endpoint), timeout=10.0)
+                    zdr_routes = (
+                        await self._openrouter_zdr_endpoint_tags(client)
+                        if not response.is_error and self.openrouter_require_zdr
+                        else None
+                    )
+            if response.is_error:
+                raise ProviderError(
+                    f"OpenRouter endpoint discovery failed (HTTP {response.status_code})"
+                )
+            payload = response.json()
+            if zdr_routes is not None and isinstance(payload, dict):
+                data = payload.get("data")
+                if isinstance(data, dict) and isinstance(data.get("endpoints"), list):
+                    payload = {
+                        **payload,
+                        "data": {
+                            **data,
+                            "endpoints": [
+                                item
+                                for item in data["endpoints"]
+                                if isinstance(item, dict)
+                                and (model, item.get("tag")) in zdr_routes
+                            ],
+                        },
+                    }
+            routes = openrouter_model_routes(payload, model=model)
+            allowed = self.openrouter_allowed_providers
+            if allowed:
+                routes = [route for route in routes if route.provider_slug in allowed]
+                if not routes:
+                    if self.openrouter_require_zdr:
+                        raise ProviderError(
+                            "No ZDR OpenRouter endpoints serve this model at the allowed upstream providers"
+                        )
+                    raise ProviderError(
+                        "None of the allowed OpenRouter providers serve this model; "
+                        "choose another model or allow more providers"
+                    )
+            if not routes:
+                if self.openrouter_require_zdr:
+                    raise ProviderError(
+                        "No ZDR OpenRouter endpoints serve this model under the profile's upstream policy"
+                    )
+                if model.startswith("~"):
+                    raise ProviderError(
+                        "OpenRouter alias models publish no endpoints of their own; "
+                        "refresh the provider so the alias target is known"
+                    )
+                raise ProviderError("OpenRouter returned no eligible model endpoints")
+            return routes
+        except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+            raise ProviderError("OpenRouter endpoint discovery failed") from exc
+
+
+def _reply_piece_events(
+    pieces: list[Piece], text_parts: list[str], reasoning_parts: list[str]
+) -> list[ModelStreamEvent]:
+    """Stream events for reply text a :class:`ReplySplitter` has settled."""
+
+    events: list[ModelStreamEvent] = []
+    for channel, piece in pieces:
+        if channel == "reasoning":
+            reasoning_parts.append(piece)
+            events.append(
+                ModelStreamEvent(type=StreamEventType.REASONING_DELTA, delta=piece)
+            )
+        else:
+            text_parts.append(piece)
+            events.append(
+                ModelStreamEvent(type=StreamEventType.TEXT_DELTA, delta=piece)
+            )
+    return events
+
+
+async def _stream_openai_compatible(
+    provider: OpenAICompatibleProvider, request: ModelRequest
+) -> AsyncIterator[ModelStreamEvent]:
+    """Stream Chat Completions SSE for vLLM and compatible runtimes."""
+
+    model = provider.require(request)
+    payload = provider._payload(request, model)
+    payload.update({"stream": True, "stream_options": {"include_usage": True}})
+    yield ModelStreamEvent(type=StreamEventType.STARTED)
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    # A runtime without a reasoning parser leaves the thought in the reply.
+    splitter = ReplySplitter(template_opened=template_opens_thinking(model))
+    call_parts: dict[int, dict[str, str]] = {}
+    openrouter = provider.config.flavor == ProviderFlavor.OPENROUTER
+    # The reasoning channels as the route sent them, for a later replay.
+    replay_message: dict[str, Any] = {}
+    replay_details: list[Any] = []
+    legacy_call = {"name": "", "arguments": ""}
+    usage = ModelUsage()
+    finish_reason: str | None = None
+    response_id: str | None = None
+    response_model = model
+    terminated = False
+    keepalives = 0
+    try:
+        async with provider._client(provider._headers()) as client:
+            async with _stream_with_retry(
+                provider.config,
+                client,
+                "POST",
+                provider._path("/v1/chat/completions"),
+                json=payload,
+                operation="chat_completions_stream",
+            ) as frames:
+                async for frame in _frames_until_finished_close(
+                    frames, lambda: finish_reason is not None, provider.config
+                ):
+                    encoded = frame.strip()
+                    if not encoded:
+                        continue
+                    if encoded == "[DONE]":
+                        # Nothing follows [DONE]. A proxy that holds the socket
+                        # open after it must not turn the reply into a timeout.
+                        terminated = True
+                        break
+                    data = _stream_frame_data(encoded)
+                    if data is None:
+                        if not keepalives:
+                            _record_keepalive_skipped(provider.config, encoded)
+                        keepalives += 1
+                        continue
+                    failure = _stream_error_frame(data)
+                    if failure is not None:
+                        raise failure
+                    # Usage-only frames may carry an explicit null; it must not
+                    # erase the id and model an earlier frame named.
+                    response_id = data.get("id") or response_id
+                    response_model = data.get("model") or response_model
+                    chunk_usage = data.get("usage")
+                    if chunk_usage:
+                        usage = _openai_usage(
+                            chunk_usage,
+                            billed=provider.config.flavor == ProviderFlavor.OPENROUTER,
+                        )
+                    choice = _first_choice(data)
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    failure = _finish_reason_failure(choice)
+                    if failure is not None:
+                        raise failure
+                    delta = choice.get("delta")
+                    if not isinstance(delta, dict):
+                        delta = {}
+                    reasoning = _openai_message_reasoning(delta)
+                    if reasoning:
+                        for event in _reply_piece_events(
+                            splitter.route_reasoning(), text_parts, reasoning_parts
+                        ):
+                            yield event
+                        reasoning_parts.append(reasoning)
+                        yield ModelStreamEvent(
+                            type=StreamEventType.REASONING_DELTA, delta=reasoning
+                        )
+                    for channel in ("reasoning_content", "reasoning"):
+                        fragment = delta.get(channel)
+                        if isinstance(fragment, str):
+                            replay_message[channel] = (
+                                replay_message.get(channel, "") + fragment
+                            )
+                    details = delta.get("reasoning_details")
+                    if isinstance(details, list):
+                        _merge_reasoning_details(replay_details, details)
+                    content = _openai_message_content(delta) or _openai_refusal(delta)
+                    if content:
+                        for event in _reply_piece_events(
+                            splitter.push(content), text_parts, reasoning_parts
+                        ):
+                            yield event
+                    _merge_tool_call_deltas(call_parts, delta.get("tool_calls"))
+                    _merge_function_call_delta(legacy_call, delta.get("function_call"))
+        if not terminated and finish_reason is None:
+            # Chat Completions ends every reply with a finish_reason and then
+            # [DONE]; a body that closes cleanly without either was cut short
+            # (a proxy idle timeout) and must not be stored as a whole answer.
+            raise ProviderError(
+                "provider stream ended before the reply completed: no finish "
+                "reason or [DONE] frame arrived"
+            )
+        for event in _reply_piece_events(
+            splitter.finish(), text_parts, reasoning_parts
+        ):
+            yield event
+        calls = _assembled_tool_calls(
+            request,
+            call_parts,
+            diagnostic_metadata={
+                "adapter": provider.config.flavor.value,
+                "model_id": response_model,
+                "provider": provider.config.id,
+                "status": finish_reason,
+                "vendor_request_id": response_id,
+            },
+        )
+        if not call_parts and legacy_call["name"]:
+            calls.append(
+                _legacy_function_call(
+                    request,
+                    legacy_call,
+                    {
+                        "adapter": provider.config.flavor.value,
+                        "model_id": response_model,
+                        "provider": provider.config.id,
+                        "status": finish_reason,
+                        "vendor_request_id": response_id,
+                    },
+                )
+            )
+        for call in calls:
+            yield ModelStreamEvent(type=StreamEventType.TOOL_CALL, tool_call=call)
+        replay_message["reasoning_details"] = replay_details
+        final = _adapter_response(
+            request,
+            provider_id=provider.config.id,
+            model=response_model,
+            text="".join(text_parts).strip(),
+            reasoning="".join(reasoning_parts).strip(),
+            tool_calls=calls,
+            usage=usage,
+            finish_reason=finish_reason,
+            provider_request_id=response_id,
+            reasoning_state=_reasoning_state(
+                provider.config.id,
+                model,
+                _openai_reasoning_fields(replay_message, openrouter=openrouter),
+                calls,
+            ),
+        )
+        yield ModelStreamEvent(type=StreamEventType.COMPLETED, response=final)
+    except asyncio.CancelledError as caught_error:
+        record_caught_exception(
+            "providers",
+            "providers.providers.caught_failure_008",
+            "A handled providers operation raised an exception.",
+            caught_error,
+            stage="providers",
+        )
+        raise
+    except Exception as exc:
+        record_caught_exception(
+            "providers",
+            "providers.providers.caught_failure_009",
+            "A handled providers operation raised an exception.",
+            exc,
+            stage="providers",
+        )
+        yield ModelStreamEvent.failure(exc)
+
+
+# ``claude-<family>-<major>[-<minor>]`` anywhere after a Bedrock provider or
+# region prefix (``anthropic.``, ``us.anthropic.``) or an ARN path.
+_CLAUDE_MODEL = re.compile(
+    r"(?:^|\.)claude-(opus|sonnet|haiku|fable|mythos)-"
+    r"(?:(preview)|(\d+)(?:[-.](\d{1,2}))?(?![0-9]))"
+)
+
+
+def _claude_model(model: str) -> tuple[str, tuple[int, int] | None] | None:
+    """Family and version of a Claude model id; ``None`` for a preview."""
+
+    match = _CLAUDE_MODEL.search(model.casefold().rsplit("/", 1)[-1])
+    if match is None:
+        return None
+    family, preview, major, minor = match.groups()
+    if preview:
+        return family, None
+    return family, (int(major), int(minor or 0))
+
+
+def _claude_rejects_sampling(model: str) -> bool:
+    """Opus 4.7+, Sonnet 5+, Fable and Mythos return 400 for ``temperature``."""
+
+    claude = _claude_model(model)
+    if claude is None:
+        return False
+    family, version = claude
+    if family in {"fable", "mythos"}:
+        return True
+    if version is None:
+        return False
+    return (family == "opus" and version >= (4, 7)) or (
+        family == "sonnet" and version >= (5, 0)
+    )
+
+
+def rejects_forced_tool_choice(model: str) -> bool:
+    """Fable 5.1, Mythos 5.1 and Mythos Preview reject ``any`` and ``tool``.
+
+    Adapters send ``auto`` instead; the caller still validates the call.
+    """
+
+    claude = _claude_model(model)
+    if claude is None or claude[0] not in {"fable", "mythos"}:
+        return False
+    return claude[1] is None or claude[1] >= (5, 1)
+
+
+def _claude_thinks_by_default(model: str) -> bool:
+    """Opus 5 and Sonnet 5 think by default and accept ``thinking: disabled``."""
+
+    claude = _claude_model(model)
+    return (
+        claude is not None
+        and claude[0] in {"opus", "sonnet"}
+        and claude[1] is not None
+        and claude[1] >= (5, 0)
+    )
+
+
+def _claude_always_thinks(model: str) -> bool:
+    """Fable and Mythos think on every request and 400 an explicit disable."""
+
+    claude = _claude_model(model)
+    return claude is not None and claude[0] in {"fable", "mythos"}
+
+
+# Nebula's levels as Claude effort levels; ``none`` has no effort equivalent.
+_CLAUDE_EFFORT: dict[str, str] = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+}
+# Share of the output budget a budget-thinking Claude model may think with at
+# each level (Vercel AI's defaults), and Anthropic's minimum budget.
+_CLAUDE_THINKING_SHARE: dict[str, float] = {
+    "minimal": 0.02,
+    "low": 0.1,
+    "medium": 0.3,
+    "high": 0.6,
+    "xhigh": 0.9,
+}
+_CLAUDE_MIN_THINKING_BUDGET = 1024
+
+
+def _claude_effort(
+    family: str, version: tuple[int, int] | None, effort: str
+) -> str | None:
+    """The ``output_config.effort`` a Claude model takes for ``effort``.
+
+    Opus 4.7+, Sonnet 5, Fable and Mythos take low through max with xhigh;
+    the 4.6 generation has max but no xhigh; Opus 4.5 stops at high; Sonnet
+    4.5, Haiku 4.5 and older models reject the field.
+    """
+
+    level = _CLAUDE_EFFORT[effort]
+    if family in {"fable", "mythos"} or version is None or version >= (4, 7):
+        return level
+    if version >= (4, 6):
+        return "max" if level == "xhigh" else level
+    if family == "opus" and version >= (4, 5):
+        return "high" if level == "xhigh" else level
+    return None
+
+
+def _claude_thinking_budget(
+    effort: str, ceiling: int | None, max_tokens: int | None
+) -> int | None:
+    """A ``budget_tokens`` below ``max_tokens`` and at least Anthropic's minimum."""
+
+    if max_tokens is None:
+        return None
+    budget = (
+        ceiling
+        if ceiling is not None
+        else round(max_tokens * _CLAUDE_THINKING_SHARE[effort])
+    )
+    budget = max(_CLAUDE_MIN_THINKING_BUDGET, min(budget, max_tokens - 1))
+    return budget if budget < max_tokens else None
+
+
+def _claude_reasoning(
+    model: str,
+    request: ModelRequest,
+    *,
+    forced: bool,
+    max_tokens: int | None,
+) -> dict[str, Any]:
+    """Messages API ``thinking`` and ``output_config`` for the requested level.
+
+    Sent at the top level to Anthropic and inside Bedrock's
+    ``additionalModelRequestFields``. Per the Claude API reference:
+
+    - ``none`` disables thinking, except on Fable and Mythos, which always
+      think; they get the lowest effort instead.
+    - Other levels set ``output_config.effort`` where the model takes it,
+      and turn on adaptive thinking (4.6 and later, with readable
+      summaries) or a thinking budget (earlier models; never
+      ``budget_tokens`` on 4.6+, where it is deprecated or a 400).
+    - Thinking cannot be switched on beside a forced tool choice, so a
+      forced request carries the effort alone.
+
+    Another model behind an Anthropic-compatible endpoint (DeepSeek, Z.ai)
+    is sent only the protocol's own disable. ``None`` sends nothing.
+    """
+
+    effort = request.reasoning_effort
+    if effort is None:
+        return {}
+    claude = _claude_model(model)
+    if claude is None:
+        return {"thinking": {"type": "disabled"}} if effort == "none" else {}
+    family, version = claude
+    if effort == "none":
+        if family in {"fable", "mythos"}:
+            return {"output_config": {"effort": "low"}}
+        return {"thinking": {"type": "disabled"}}
+    fields: dict[str, Any] = {}
+    level = _claude_effort(family, version, effort)
+    if level is not None:
+        fields["output_config"] = {"effort": level}
+    if forced:
+        return fields
+    if family in {"fable", "mythos"} or version is None or version >= (4, 6):
+        fields["thinking"] = {"type": "adaptive", "display": "summarized"}
+    else:
+        budget = _claude_thinking_budget(
+            effort, request.reasoning_max_tokens, max_tokens
+        )
+        if budget is not None:
+            fields["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    return fields
+
+
+def _claude_thinking_on(fields: dict[str, Any]) -> bool:
+    thinking = fields.get("thinking")
+    return isinstance(thinking, dict) and thinking.get("type") in {
+        "adaptive",
+        "enabled",
+    }
+
+
+class AnthropicProvider(ModelProvider):
+    def _headers(self) -> dict[str, str]:
+        key = self.config.resolve_api_key()
+        if not key:
+            raise ProviderError("Anthropic requires an API key")
+        return {
+            "x-api-key": key.get_secret_value(),
+            "anthropic-version": self.config.options.get(
+                "anthropic_version", "2023-06-01"
+            ),
+            "Content-Type": "application/json",
+        }
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        model = self.require(request)
+        wire_names = _wire_tool_names(request)
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": request.max_output_tokens or 4096,
+            "messages": [
+                _anthropic_message(message)
+                for message in request.messages
+                if message.role != "system"
+            ],
+        }
+        conversation_end = len(payload["messages"])
+        for batch, state in _replayed_batches(request, self.config.id, model):
+            # Thinking goes back unchanged ahead of the calls it led to, and
+            # all of a batch's results in one user message: split results
+            # teach Claude to stop making parallel calls.
+            thinking = state.get("thinking_blocks") if state else None
+            results: list[dict[str, Any]] = []
+            for result in batch:
+                content: str | list[dict[str, Any]] = _result_text(result)
+                if result.attachments:
+                    content = [
+                        {"type": "text", "text": content},
+                        *_anthropic_message(
+                            ModelMessage(role="user", content=result.attachments)
+                        )["content"],
+                    ]
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": content,
+                        "is_error": result.is_error,
+                    }
+                )
+            payload["messages"].extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            *(thinking if isinstance(thinking, list) else []),
+                            *(
+                                [{"type": "text", "text": batch[0].response_text}]
+                                if batch[0].response_text
+                                else []
+                            ),
+                            *(
+                                {
+                                    "type": "tool_use",
+                                    "id": result.call_id,
+                                    "name": wire_names.get(result.name, result.name),
+                                    "input": result.arguments,
+                                }
+                                for result in batch
+                            ),
+                        ],
+                    },
+                    {"role": "user", "content": results},
+                ]
+            )
+        systems = [m.content for m in request.messages if m.role == "system"]
+        if request.instructions or systems:
+            payload["system"] = "\n".join(
+                [str(item) for item in [*systems, request.instructions] if item]
+            )
+        reasoning = _claude_reasoning(
+            model,
+            request,
+            forced=request.tool_choice == ToolChoice.REQUIRED
+            and not rejects_forced_tool_choice(model),
+            max_tokens=payload["max_tokens"],
+        )
+        payload.update(reasoning)
+        if (
+            request.temperature is not None
+            and not _claude_rejects_sampling(model)
+            # Thinking takes no sampling parameters.
+            and not _claude_thinking_on(reasoning)
+        ):
+            payload["temperature"] = request.temperature
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "name": wire_names.get(tool.name, tool.name),
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in request.tools
+            ]
+            if request.tool_choice == ToolChoice.REQUIRED:
+                payload["tool_choice"] = {
+                    "type": "auto" if rejects_forced_tool_choice(model) else "any",
+                    "disable_parallel_tool_use": not request.parallel_tool_calls,
+                }
+            elif request.tool_choice == ToolChoice.NONE:
+                # Not a forced choice: every Claude model takes it, thinking
+                # included.
+                payload["tool_choice"] = {"type": "none"}
+        elif request.tool_results:
+            # Messages rejects tool_use/tool_result blocks in a request that
+            # declares no tools, so a caller replaying history without them
+            # gets each replayed name declared, with calling off.
+            payload["tools"] = [
+                {
+                    "name": name,
+                    "description": _REPLAYED_TOOL_DESCRIPTION,
+                    "input_schema": {"type": "object"},
+                }
+                for name in _replayed_wire_names(request, wire_names)
+            ]
+            payload["tool_choice"] = {"type": "none"}
+        if _anthropic_caches(self.config, model):
+            _mark_anthropic_cache(payload, request, conversation_end)
+        async with self._client(
+            self._headers(), timeout=_native_http_timeout(self.config)
+        ) as client:
+            response = await self._post(
+                client,
+                self._path("/v1/messages"),
+                payload,
+                operation="messages",
+            )
+            retry = _refused_reasoning_off_retry(payload, response)
+            if retry is not None:
+                _record_reasoning_off_refused(self.config, model)
+                response = await self._post(
+                    client,
+                    self._path("/v1/messages"),
+                    retry,
+                    operation="messages",
+                )
+        if response.is_error:
+            raise _safe_error(response)
+        data = response.json()
+        if data.get("stop_reason") == _CONTEXT_WINDOW_STOP_REASON:
+            raise _context_window_stop(_CONTEXT_WINDOW_STOP_REASON)
+        text_parts: list[str] = []
+        thoughts: list[str] = []
+        calls: list[ToolCall] = []
+        thinking_blocks: list[dict[str, Any]] = []
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") in {"thinking", "redacted_thinking"}:
+                # Kept exactly as sent: an edited block fails its signature.
+                thinking_blocks.append(block)
+                # A summarized thought is readable; an omitted or redacted
+                # one has no text to show.
+                thought = block.get("thinking")
+                if isinstance(thought, str) and thought.strip():
+                    thoughts.append(thought)
+            elif block.get("type") == "tool_use":
+                calls.append(
+                    _tool_call(
+                        request,
+                        call_id=block.get("id"),
+                        name=block.get("name"),
+                        arguments=block.get("input"),
+                        diagnostic_metadata={
+                            "adapter": self.config.kind.value,
+                            "model_id": data.get("model") or model,
+                            "provider": self.config.id,
+                            "status": data.get("stop_reason"),
+                            "vendor_request_id": data.get("id"),
+                        },
+                    )
+                )
+        if data.get("stop_reason") == "refusal":
+            # Claude's safeguards refuse with HTTP 200. A refusal Claude
+            # explained is its answer; no call from a refused turn runs.
+            calls = []
+            if not "".join(text_parts).strip():
+                raise _anthropic_refusal(data)
+        return _adapter_response(
+            request,
+            provider_id=self.config.id,
+            model=data.get("model", model),
+            text="".join(text_parts),
+            reasoning="\n\n".join(thoughts),
+            tool_calls=calls,
+            usage=_anthropic_usage(data.get("usage")),
+            finish_reason=data.get("stop_reason"),
+            provider_request_id=data.get("id"),
+            raw=data,
+            reasoning_state=_reasoning_state(
+                self.config.id,
+                model,
+                {"thinking_blocks": thinking_blocks} if thinking_blocks else {},
+            ),
+        )
+
+    async def health(self) -> ProviderHealth:
+        try:
+            models: list[str] = []
+            params: dict[str, str] = {"limit": "1000"}
+            async with self._client(self._headers()) as client:
+                # The list is paged (20 rows by default); a model past the
+                # first page must not look like one the account lost.
+                for _page in range(20):
+                    response = await client.get(self._path("/v1/models"), params=params)
+                    if response.is_error:
+                        raise _safe_error(response)
+                    payload = response.json()
+                    rows = payload.get("data") if isinstance(payload, dict) else None
+                    models.extend(
+                        item["id"]
+                        for item in (rows if isinstance(rows, list) else [])
+                        if isinstance(item, dict) and isinstance(item.get("id"), str)
+                    )
+                    last_id = (
+                        payload.get("last_id") if isinstance(payload, dict) else None
+                    )
+                    if (
+                        not isinstance(payload, dict)
+                        or not payload.get("has_more")
+                        or not isinstance(last_id, str)
+                        or not last_id
+                    ):
+                        break
+                    params = {**params, "after_id": last_id}
+            return ProviderHealth(
+                provider_id=self.config.id,
+                healthy=True,
+                models=list(dict.fromkeys(models)),
+            )
+        except Exception as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_010",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            return ProviderHealth(
+                provider_id=self.config.id, healthy=False, detail=str(exc)
+            )
+
+
+# Gemini's REST function calls usually carry no ``id``; Nebula needs one to
+# pair a call with its result. Ids Nebula made up are never echoed to Gemini.
+_GEMINI_SYNTHETIC_CALL_ID = "nebula-gemini-call:"
+
+
+def _gemini_call_scope(response_id: Any) -> str:
+    """Scope made-up call ids to one response.
+
+    ``responseId`` is optional. Without a fresh scope per response, every
+    step's first call would get the same id, and a later step would look like
+    a replay of an earlier one.
+    """
+
+    if isinstance(response_id, str) and response_id:
+        return response_id
+    return uuid.uuid4().hex
+
+
+def _gemini_call_id(value: Any, scope: str, index: int) -> str:
+    if isinstance(value, str) and value:
+        return value
+    return f"{_GEMINI_SYNTHETIC_CALL_ID}{scope}:{index}"
+
+
+def _gemini_call_identity(call_id: str) -> dict[str, str]:
+    if call_id.startswith(_GEMINI_SYNTHETIC_CALL_ID):
+        return {}
+    return {"id": call_id}
+
+
+# Google's documented value for replaying a function call whose signature the
+# client does not have (a step Core ran itself, or older history); without a
+# signature Gemini 3 rejects the request with HTTP 400.
+_GEMINI_SKIP_SIGNATURE = "skip_thought_signature_validator"
+_GEMINI_UNSIGNED_MODEL = re.compile(
+    r"^gemini-(?:1|2)(?:[.-]|$)|^gemini-pro(?:-vision)?$"
+    r"|^gemini-robotics-er-1\.5(?:[.-]|$)"
+)
+
+
+def _gemini_validates_signatures(model: str) -> bool:
+    """Gemini 3 and later; unknown Gemini ids get the newest behavior (Vercel)."""
+
+    name = _model_name(model)
+    return name.startswith("gemini-") and _GEMINI_UNSIGNED_MODEL.match(name) is None
+
+
+def _gemini_call_parts(
+    batch: list[ModelToolResult], state: dict[str, Any] | None, model: str
+) -> list[dict[str, Any]]:
+    """One model turn's function calls, each with the signature it came with.
+
+    Gemini signs only the first call of a parallel batch, so a later call
+    without one is correct as it is; a batch with no signature at all gets
+    the sentinel on Gemini 3.
+    """
+
+    parts: list[dict[str, Any]] = []
+    signed = False
+    for result in batch:
+        part: dict[str, Any] = {
+            "functionCall": {
+                **_gemini_call_identity(result.call_id),
+                "name": result.name,
+                "args": result.arguments,
+            }
+        }
+        signature = _call_metadata(result, state, "thought_signature")
+        if isinstance(signature, str) and signature:
+            part["thoughtSignature"] = signature
+            signed = True
+        elif not signed and _gemini_validates_signatures(model):
+            part["thoughtSignature"] = _GEMINI_SKIP_SIGNATURE
+        parts.append(part)
+    return parts
+
+
+# ``gemini-<major>[.<minor>]-pro|flash``: Gemini 3 and later take a
+# ``thinkingLevel``. Gemini 2.5 takes a token budget instead.
+_GEMINI_LEVEL_MODEL = re.compile(r"gemini-(\d+)(?:\.(\d+))?-(pro|flash)")
+_GEMINI_25_MODEL = re.compile(r"gemini-2\.5-(flash-lite|flash|pro)")
+# Variants that do not think (image, speech and live models).
+_GEMINI_NON_THINKING = re.compile(r"image|tts|audio|live|embedding")
+# Gemini 2.5 thinking budgets per level (pi-mono's); 2.5 Pro cannot switch
+# thinking off, so ``none`` is its 128-token minimum.
+_GEMINI_25_BUDGETS: dict[str, dict[str, int]] = {
+    "pro": {
+        "none": 128,
+        "minimal": 128,
+        "low": 2_048,
+        "medium": 8_192,
+        "high": 32_768,
+        "xhigh": 32_768,
+    },
+    "flash": {
+        "none": 0,
+        "minimal": 128,
+        "low": 2_048,
+        "medium": 8_192,
+        "high": 24_576,
+        "xhigh": 24_576,
+    },
+    "flash-lite": {
+        "none": 0,
+        "minimal": 512,
+        "low": 2_048,
+        "medium": 8_192,
+        "high": 24_576,
+        "xhigh": 24_576,
+    },
+}
+_GEMINI_25_BUDGET_RANGE: dict[str, tuple[int, int]] = {
+    "pro": (128, 32_768),
+    "flash": (1, 24_576),
+    "flash-lite": (512, 24_576),
+}
+
+
+def _gemini_lowest_level(name: str) -> str | None:
+    """The lowest ``thinkingLevel`` of a Gemini 3+ model; ``None`` otherwise.
+
+    Gemini 3 cannot switch thinking off. Flash's floor is ``minimal`` (``low``
+    from 3.7, as Vercel AI maps it); Pro's is ``low``.
+    """
+
+    if name == "gemini-flash-latest":
+        return "low"
+    if name == "gemini-flash-lite-latest":
+        return "minimal"
+    match = _GEMINI_LEVEL_MODEL.match(name)
+    if match is None or int(match.group(1)) < 3:
+        return None
+    if match.group(3) == "pro":
+        return "low"
+    version = (int(match.group(1)), int(match.group(2) or 0))
+    lite = name[match.end() :].startswith("-lite")
+    return "low" if version >= (3, 7) and not lite else "minimal"
+
+
+def _gemini_thinking_config(model: str, request: ModelRequest) -> dict[str, Any] | None:
+    """``generationConfig.thinkingConfig`` for the requested level.
+
+    ``includeThoughts`` returns thought summaries, which are read as
+    reasoning. ``None`` (no level, or a model with no thinking control)
+    leaves the model's default.
+    """
+
+    effort = request.reasoning_effort
+    if effort is None:
+        return None
+    name = _model_name(model)
+    if _GEMINI_NON_THINKING.search(name):
+        return None
+    config: dict[str, Any]
+    floor = _gemini_lowest_level(name)
+    if floor is not None:
+        levels = {
+            "none": floor,
+            "minimal": floor,
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "high",
+        }
+        config = {"thinkingLevel": levels[effort]}
+    else:
+        match = _GEMINI_25_MODEL.match(name)
+        if match is None:
+            return None
+        variant = match.group(1)
+        budget = _GEMINI_25_BUDGETS[variant][effort]
+        if effort != "none" and request.reasoning_max_tokens is not None:
+            lowest, highest = _GEMINI_25_BUDGET_RANGE[variant]
+            budget = max(lowest, min(request.reasoning_max_tokens, highest))
+        config = {"thinkingBudget": budget}
+    if effort != "none":
+        config["includeThoughts"] = True
+    return config
+
+
+class GeminiProvider(ModelProvider):
+    def _headers(self) -> dict[str, str]:
+        key = self.config.resolve_api_key()
+        if not key:
+            raise ProviderError("Gemini/Vertex requires an API key or access token")
+        if self.config.flavor == ProviderFlavor.VERTEX:
+            return {
+                "Authorization": f"Bearer {key.get_secret_value()}",
+                "Content-Type": "application/json",
+            }
+        return {
+            "x-goog-api-key": key.get_secret_value(),
+            "Content-Type": "application/json",
+        }
+
+    def _model_path(self, model: str, operation: str) -> str:
+        if self.config.flavor != ProviderFlavor.VERTEX:
+            return self._path(f"/v1beta/models/{model}:{operation}")
+        project = self.config.options.get("project")
+        location = self.config.options.get("location")
+        if not project or not location:
+            raise ProviderError("Vertex profiles require project and location options")
+        publisher = self.config.options.get("publisher", "google")
+        return (
+            f"/v1/projects/{project}/locations/{location}/publishers/"
+            f"{publisher}/models/{model}:{operation}"
+        )
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        model = self.require(request)
+        contents = []
+        for message in request.messages:
+            if message.role == "system":
+                continue
+            role = "model" if message.role == "assistant" else "user"
+            parts = _gemini_parts(message.content)
+            contents.append({"role": role, "parts": parts})
+        for batch, state in _replayed_batches(request, self.config.id, model):
+            # One model turn with every call of the batch, then one user turn
+            # with every response; a screenshot follows its own response.
+            responses: list[dict[str, Any]] = []
+            for result in batch:
+                responses.append(
+                    {
+                        "functionResponse": {
+                            **_gemini_call_identity(result.call_id),
+                            "name": result.name,
+                            "response": (
+                                result.output
+                                if isinstance(result.output, dict)
+                                else {"output": result.output}
+                            ),
+                        }
+                    }
+                )
+                responses.extend(_gemini_parts(result.attachments))
+            contents.extend(
+                [
+                    {
+                        "role": "model",
+                        "parts": [
+                            *(
+                                [{"text": batch[0].response_text}]
+                                if batch[0].response_text
+                                else []
+                            ),
+                            *_gemini_call_parts(batch, state, model),
+                        ],
+                    },
+                    {"role": "user", "parts": responses},
+                ]
+            )
+        payload: dict[str, Any] = {"contents": contents}
+        system_parts = [str(m.content) for m in request.messages if m.role == "system"]
+        if request.instructions:
+            system_parts.append(request.instructions)
+        if system_parts:
+            payload["systemInstruction"] = {
+                "parts": [{"text": "\n".join(system_parts)}]
+            }
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": tool.name,
+                            "description": tool.description,
+                            # ``parameters`` is Gemini's OpenAPI subset and
+                            # rejects empty objects, ``const`` and
+                            # ``additionalProperties``; this takes JSON Schema.
+                            "parametersJsonSchema": tool.input_schema,
+                        }
+                        for tool in request.tools
+                    ]
+                }
+            ]
+            if request.tool_choice == ToolChoice.REQUIRED:
+                payload["toolConfig"] = {"functionCallingConfig": {"mode": "ANY"}}
+            elif request.tool_choice == ToolChoice.NONE:
+                payload["toolConfig"] = {"functionCallingConfig": {"mode": "NONE"}}
+        generation: dict[str, Any] = {}
+        if request.max_output_tokens:
+            generation["maxOutputTokens"] = request.max_output_tokens
+        if request.temperature is not None:
+            generation["temperature"] = request.temperature
+        if request.response_schema:
+            generation.update(
+                {
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": request.response_schema,
+                }
+            )
+        thinking = _gemini_thinking_config(model, request)
+        if thinking is not None:
+            generation["thinkingConfig"] = thinking
+        if generation:
+            payload["generationConfig"] = generation
+        async with self._client(
+            self._headers(), timeout=_native_http_timeout(self.config)
+        ) as client:
+            response = await self._post(
+                client,
+                self._model_path(model, "generateContent"),
+                payload,
+                operation="generate_content",
+            )
+        if response.is_error:
+            raise _safe_error(response)
+        data = response.json()
+        _raise_gemini_outcome(request, data)
+        candidate = (data.get("candidates") or [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        # ``thought: true`` marks a thought summary, not the answer
+        # (pi-mono ``isThinkingPart``).
+        text_parts = [
+            part.get("text", "")
+            for part in parts
+            if "text" in part and part.get("thought") is not True
+        ]
+        thoughts = [
+            part["text"]
+            for part in parts
+            if part.get("thought") is True
+            and isinstance(part.get("text"), str)
+            and part["text"].strip()
+        ]
+        call_scope = _gemini_call_scope(data.get("responseId"))
+        calls: list[ToolCall] = []
+        for index, part in enumerate(parts):
+            if "functionCall" not in part:
+                continue
+            function = part["functionCall"]
+            if not isinstance(function, dict):
+                function = {}
+            calls.append(
+                _tool_call(
+                    request,
+                    call_id=_gemini_call_id(function.get("id"), call_scope, index),
+                    name=function.get("name"),
+                    arguments=function.get("args"),
+                    diagnostic_metadata={
+                        "adapter": self.config.kind.value,
+                        "model_id": model,
+                        "provider": self.config.id,
+                        "status": candidate.get("finishReason"),
+                        "vendor_request_id": data.get("responseId"),
+                    },
+                    provider_metadata=(
+                        {"thought_signature": part["thoughtSignature"]}
+                        if isinstance(part.get("thoughtSignature"), str)
+                        and part["thoughtSignature"]
+                        else None
+                    ),
+                )
+            )
+        usage = data.get("usageMetadata") or {}
+        return _adapter_response(
+            request,
+            provider_id=self.config.id,
+            model=model,
+            text="".join(text_parts),
+            reasoning="\n\n".join(thoughts),
+            tool_calls=calls,
+            usage=ModelUsage(
+                input_tokens=usage.get("promptTokenCount", 0),
+                output_tokens=usage.get("candidatesTokenCount", 0),
+                total_tokens=usage.get("totalTokenCount", 0),
+                # Implicit cache hits, already part of promptTokenCount.
+                cached_input_tokens=_token_count(usage.get("cachedContentTokenCount")),
+            ),
+            finish_reason=candidate.get("finishReason"),
+            provider_request_id=data.get("responseId"),
+            raw=data,
+            reasoning_state=_reasoning_state(self.config.id, model, {}, calls),
+        )
+
+    async def health(self) -> ProviderHealth:
+        try:
+            if self.config.flavor == ProviderFlavor.VERTEX:
+                project = self.config.options.get("project")
+                location = self.config.options.get("location")
+                if not project or not location:
+                    raise ProviderError(
+                        "Vertex profiles require project and location options"
+                    )
+                path = f"/v1/projects/{project}/locations/{location}/publishers/google/models"
+                params: dict[str, str] = {}
+            else:
+                path = self._path("/v1beta/models")
+                params = {"pageSize": "1000"}
+            models: list[str] = []
+            async with self._client(self._headers()) as client:
+                # Google pages the catalog (50 rows by default); follow the
+                # token so a model past page one is not reported as gone.
+                for _page in range(20):
+                    response = await client.get(path, params=params)
+                    if response.is_error:
+                        raise _safe_error(response)
+                    payload = response.json()
+                    rows = payload.get("models") if isinstance(payload, dict) else None
+                    models.extend(
+                        item["name"].rsplit("/", 1)[-1]
+                        for item in (rows if isinstance(rows, list) else [])
+                        if isinstance(item, dict) and isinstance(item.get("name"), str)
+                    )
+                    token = (
+                        payload.get("nextPageToken")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    if not isinstance(token, str) or not token:
+                        break
+                    params = {**params, "pageToken": token}
+            return ProviderHealth(
+                provider_id=self.config.id,
+                healthy=True,
+                models=list(dict.fromkeys(models)),
+            )
+        except Exception as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_011",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            return ProviderHealth(
+                provider_id=self.config.id, healthy=False, detail=str(exc)
+            )
+
+
+def _bedrock_error_detail(exc: BaseException) -> str:
+    """Describe a boto3 failure without leaking its types into the adapter.
+
+    A botocore ClientError carries the actionable code and message
+    ("ValidationException: The provided model identifier is invalid");
+    anything else is reported by type name only.
+    """
+
+    response = getattr(exc, "response", None)
+    error = response.get("Error") if isinstance(response, dict) else None
+    if isinstance(error, dict):
+        code = str(error.get("Code") or "").strip()
+        message = re.sub(r"\s+", " ", str(error.get("Message") or "")).strip()
+        detail = ": ".join(part for part in (code, message) if part)
+        if detail:
+            return redact_text(detail)[:500]
+    return type(exc).__name__
+
+
+# Converse errors that mean nothing was generated, so the request may be resent.
+_BEDROCK_TRANSIENT_ERRORS = frozenset(
+    {
+        "ThrottlingException",
+        "ServiceUnavailableException",
+        "ModelNotReadyException",
+        "InternalServerException",
+        "ModelTimeoutException",
+    }
+)
+
+
+# A connection that never opened cannot have reached Bedrock, so the request
+# is resent, as the httpx adapters resend ``ConnectError`` and
+# ``ConnectTimeout``. botocore's own retries are off, and a read timeout is
+# still never resent.
+_BEDROCK_UNOPENED_CONNECTION_ERRORS = (
+    BotocoreEndpointConnectionError,
+    BotocoreConnectTimeoutError,
+)
+
+
+def _bedrock_failure(exc: BaseException) -> ProviderError:
+    """Type a Converse failure so chat can compact and retry an overflow."""
+
+    detail = _bedrock_error_detail(exc)
+    message = f"Bedrock request failed: {detail}"
+    if isinstance(exc, _BEDROCK_UNOPENED_CONNECTION_ERRORS):
+        return ProviderOverloadedError(message)
+    if _context_length_error(detail, None):
+        return ProviderContextLengthError(message)
+    response = getattr(exc, "response", None)
+    response = response if isinstance(response, dict) else {}
+    error = response.get("Error")
+    if isinstance(error, dict) and error.get("Code") in _BEDROCK_TRANSIENT_ERRORS:
+        metadata = response.get("ResponseMetadata")
+        status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+        return ProviderOverloadedError(
+            message, status_code=status if isinstance(status, int) else None
+        )
+    return ProviderError(message)
+
+
+def _bedrock_alternating(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge adjacent same-role messages; Converse requires alternation."""
+
+    merged: list[dict[str, Any]] = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            merged[-1] = {
+                "role": message["role"],
+                "content": [*merged[-1]["content"], *message["content"]],
+            }
+        else:
+            merged.append(message)
+    return merged
+
+
+class BedrockProvider(ModelProvider):
+    """AWS Bedrock Converse adapter using boto3 without leaking its types."""
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        model = self.require(request)
+        wire_names = _wire_tool_names(request)
+        kwargs: dict[str, Any] = {
+            "modelId": model,
+            "messages": [
+                {
+                    "role": "assistant" if msg.role == "assistant" else "user",
+                    "content": _bedrock_content(msg.content),
+                }
+                for msg in request.messages
+                if msg.role != "system"
+            ],
+        }
+        conversation_end = len(kwargs["messages"])
+        for batch, _state in _replayed_batches(request, self.config.id, model):
+            # One assistant message with the batch's calls, then one user
+            # message with all of their results.
+            kwargs["messages"].extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            *(
+                                [{"text": batch[0].response_text}]
+                                if batch[0].response_text
+                                else []
+                            ),
+                            *(
+                                {
+                                    "toolUse": {
+                                        "toolUseId": result.call_id,
+                                        "name": wire_names.get(
+                                            result.name, result.name
+                                        ),
+                                        "input": result.arguments,
+                                    }
+                                }
+                                for result in batch
+                            ),
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "toolResult": {
+                                    "toolUseId": result.call_id,
+                                    "content": [
+                                        (
+                                            {"json": result.output}
+                                            if isinstance(result.output, dict)
+                                            else {"text": result.output}
+                                        ),
+                                        *_bedrock_content(result.attachments),
+                                    ],
+                                    "status": "error" if result.is_error else "success",
+                                }
+                            }
+                            for result in batch
+                        ],
+                    },
+                ]
+            )
+        systems = [str(m.content) for m in request.messages if m.role == "system"]
+        if request.instructions:
+            systems.append(request.instructions)
+        if systems:
+            kwargs["system"] = [{"text": "\n".join(systems)}]
+        forced = False
+        if request.tools:
+            kwargs["toolConfig"] = {
+                "tools": [
+                    {
+                        "toolSpec": {
+                            "name": wire_names.get(tool.name, tool.name),
+                            "description": tool.description,
+                            "inputSchema": {"json": tool.input_schema},
+                        }
+                    }
+                    for tool in request.tools
+                ]
+            }
+            # Converse has no "none" choice, so ToolChoice.NONE is sent as its
+            # default, auto: the declarations the replayed toolUse blocks need
+            # stay, and a call the model makes anyway is the caller's to
+            # recover, as on any route that ignores the control.
+            if request.tool_choice == ToolChoice.REQUIRED:
+                if rejects_forced_tool_choice(model):
+                    kwargs["toolConfig"]["toolChoice"] = {"auto": {}}
+                else:
+                    kwargs["toolConfig"]["toolChoice"] = {"any": {}}
+                    forced = True
+        elif request.tool_results:
+            # Converse rejects toolUse/toolResult blocks without a toolConfig,
+            # so a caller replaying history without tools gets each replayed
+            # name declared.
+            kwargs["toolConfig"] = {
+                "tools": [
+                    {
+                        "toolSpec": {
+                            "name": name,
+                            "description": _REPLAYED_TOOL_DESCRIPTION,
+                            "inputSchema": {"json": {"type": "object"}},
+                        }
+                    }
+                    for name in _replayed_wire_names(request, wire_names)
+                ]
+            }
+        # Claude takes the Messages API reasoning fields through Converse's
+        # passthrough; other Bedrock families are not sent them.
+        reasoning = (
+            _claude_reasoning(
+                model,
+                request,
+                forced=forced,
+                max_tokens=request.max_output_tokens,
+            )
+            if _claude_model(model) is not None
+            else {}
+        )
+        if forced and _claude_thinks_by_default(model):
+            # Bedrock accepts a forced choice only with thinking off, and Opus
+            # 5 accepts thinking off only at effort high or below.
+            reasoning["thinking"] = {"type": "disabled"}
+            output = reasoning.get("output_config")
+            claude = _claude_model(model)
+            if (
+                isinstance(output, dict)
+                and output.get("effort") in {"xhigh", "max"}
+                and claude is not None
+                and claude[0] == "opus"
+            ):
+                output["effort"] = "high"
+        if reasoning:
+            kwargs["additionalModelRequestFields"] = reasoning
+        inference: dict[str, Any] = {}
+        if request.max_output_tokens:
+            inference["maxTokens"] = request.max_output_tokens
+        if (
+            request.temperature is not None
+            and not _claude_rejects_sampling(model)
+            and not _claude_thinking_on(reasoning)
+        ):
+            inference["temperature"] = request.temperature
+        if inference:
+            kwargs["inferenceConfig"] = inference
+        if _bedrock_caches(self.config, model):
+            _mark_bedrock_cache(kwargs, request, conversation_end)
+        kwargs["messages"] = _bedrock_alternating(kwargs["messages"])
+
+        def invoke(read_timeout: float) -> dict[str, Any]:
+            # botocore would otherwise resend a whole generation up to five
+            # times after its 60 s read timeout; Nebula's retry policy decides
+            # instead.
+            client = boto3.client(
+                "bedrock-runtime",
+                region_name=self.config.options.get("region"),
+                config=BotocoreConfig(
+                    connect_timeout=min(_NATIVE_CONNECT_TIMEOUT_SECONDS, read_timeout),
+                    read_timeout=read_timeout,
+                    retries={"mode": "standard", "max_attempts": 1},
+                ),
+            )
+            return client.converse(**kwargs)
+
+        policy = retry_policy(self.config)
+        # Resends share the first attempt's allowance, as in _send_with_retry.
+        deadline = _InferenceDeadline.start(self.config)
+        attempt = 1
+        while True:
+            try:
+                data = await asyncio.to_thread(
+                    invoke,
+                    deadline.seconds if attempt == 1 else deadline.remaining(),
+                )
+                break
+            except Exception as exc:
+                record_caught_exception(
+                    "providers",
+                    "providers.providers.caught_failure_012",
+                    "A handled providers operation raised an exception.",
+                    exc,
+                    stage="providers",
+                )
+                failure = _bedrock_failure(exc)
+                if not isinstance(failure, ProviderOverloadedError):
+                    raise failure from exc
+                delay = _retry_delay(policy, attempt, None)
+                if attempt >= policy.attempts or not deadline.admits(delay):
+                    if attempt > 1:
+                        raise _exhausted(failure, attempt) from exc
+                    raise failure from exc
+                _record_retry(
+                    self.config,
+                    operation="converse",
+                    attempt=attempt,
+                    policy=policy,
+                    delay=delay,
+                    status_code=failure.status_code,
+                )
+            await asyncio.sleep(delay)
+            attempt += 1
+        _raise_bedrock_outcome(request, data)
+        blocks = data.get("output", {}).get("message", {}).get("content", [])
+        calls: list[ToolCall] = []
+        for block in blocks:
+            if "toolUse" not in block:
+                continue
+            tool_use = block["toolUse"]
+            if not isinstance(tool_use, dict):
+                tool_use = {}
+            calls.append(
+                _tool_call(
+                    request,
+                    call_id=tool_use.get("toolUseId"),
+                    name=tool_use.get("name"),
+                    arguments=tool_use.get("input"),
+                    diagnostic_metadata={
+                        "adapter": self.config.kind.value,
+                        "model_id": model,
+                        "provider": self.config.id,
+                        "status": data.get("stopReason"),
+                    },
+                )
+            )
+        usage = data.get("usage") or {}
+        thoughts: list[str] = []
+        for block in blocks:
+            content = block.get("reasoningContent")
+            text = content.get("reasoningText") if isinstance(content, dict) else None
+            thought = text.get("text") if isinstance(text, dict) else None
+            if isinstance(thought, str) and thought.strip():
+                thoughts.append(thought)
+        return _adapter_response(
+            request,
+            provider_id=self.config.id,
+            model=model,
+            text="".join(block.get("text", "") for block in blocks),
+            reasoning="\n\n".join(thoughts),
+            tool_calls=calls,
+            usage=_bedrock_usage(usage),
+            finish_reason=data.get("stopReason"),
+            provider_request_id=(data.get("ResponseMetadata") or {}).get("RequestId"),
+            raw=data,
+        )
+
+    async def health(self) -> ProviderHealth:
+        def discover() -> list[str]:
+            client = boto3.client(
+                "bedrock",
+                region_name=self.config.options.get("region"),
+            )
+            response = client.list_foundation_models()
+            return [
+                item["modelId"]
+                for item in response.get("modelSummaries", [])
+                if isinstance(item.get("modelId"), str)
+            ]
+
+        try:
+            models = await asyncio.to_thread(discover)
+            return ProviderHealth(
+                provider_id=self.config.id,
+                healthy=True,
+                models=list(dict.fromkeys(models)),
+            )
+        except Exception as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_013",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            return ProviderHealth(
+                provider_id=self.config.id,
+                healthy=False,
+                detail=f"Bedrock health check failed: {_bedrock_error_detail(exc)}",
+            )
+
+
+PROVIDER_CATALOG: dict[ProviderFlavor, ProviderCatalogEntry] = {
+    entry.flavor: entry
+    for entry in [
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.OPENAI,
+            adapter=ProviderKind.OPENAI_RESPONSES,
+            display_name="OpenAI",
+            default_base_url="https://api.openai.com",
+            suggested_key_env="OPENAI_API_KEY",
+            support_tier="native",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.ANTHROPIC,
+            adapter=ProviderKind.ANTHROPIC,
+            display_name="Anthropic",
+            default_base_url="https://api.anthropic.com",
+            suggested_key_env="ANTHROPIC_API_KEY",
+            support_tier="native",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.GEMINI,
+            adapter=ProviderKind.GEMINI,
+            display_name="Google Gemini",
+            default_base_url="https://generativelanguage.googleapis.com",
+            suggested_key_env="GEMINI_API_KEY",
+            support_tier="native",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.VERTEX,
+            adapter=ProviderKind.GEMINI,
+            display_name="Google Vertex AI",
+            suggested_key_env="GOOGLE_ACCESS_TOKEN",
+            support_tier="native",
+            notes="Requires a Vertex endpoint and OAuth header profile; capabilities are contract-tested per deployment.",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.BEDROCK,
+            adapter=ProviderKind.BEDROCK,
+            display_name="AWS Bedrock",
+            default_base_url="https://bedrock-runtime.amazonaws.com",
+            suggested_key_env=None,
+            support_tier="native",
+            notes="Uses the AWS credential chain; credentials are never sent to sandbox workers.",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.AZURE_OPENAI,
+            adapter=ProviderKind.OPENAI_RESPONSES,
+            display_name="Azure OpenAI",
+            suggested_key_env="AZURE_OPENAI_API_KEY",
+            support_tier="native",
+            notes="Use the resource `/openai/v1` endpoint and set api_key_header=api-key.",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.MICROSOFT_FOUNDRY,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Microsoft Foundry",
+            suggested_key_env="AZURE_AI_API_KEY",
+            support_tier="native",
+            notes="Supports Foundry deployments exposing the OpenAI v1 contract.",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.MISTRAL,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Mistral",
+            default_base_url="https://api.mistral.ai/v1",
+            suggested_key_env="MISTRAL_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.COHERE,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Cohere",
+            suggested_key_env="COHERE_API_KEY",
+            support_tier="gateway",
+            notes="Use a tested OpenAI-compatible gateway profile until the native contract is enabled.",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.XAI,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="xAI",
+            default_base_url="https://api.x.ai/v1",
+            suggested_key_env="XAI_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.DEEPSEEK,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="DeepSeek",
+            default_base_url="https://api.deepseek.com/v1",
+            suggested_key_env="DEEPSEEK_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.GROQ,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Groq",
+            default_base_url="https://api.groq.com/openai/v1",
+            suggested_key_env="GROQ_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.TOGETHER,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Together AI",
+            default_base_url="https://api.together.xyz/v1",
+            suggested_key_env="TOGETHER_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.FIREWORKS,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Fireworks AI",
+            default_base_url="https://api.fireworks.ai/inference/v1",
+            suggested_key_env="FIREWORKS_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.OPENROUTER,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="OpenRouter",
+            default_base_url="https://openrouter.ai/api/v1",
+            suggested_key_env="OPENROUTER_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.ORCAROUTER,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="OrcaRouter",
+            default_base_url="https://api.orcarouter.ai/v1",
+            suggested_key_env="ORCAROUTER_API_KEY",
+            support_tier="standard",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.LITELLM,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="LiteLLM proxy",
+            support_tier="gateway",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.OLLAMA,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Ollama",
+            local=True,
+            default_base_url="http://127.0.0.1:11434/v1",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.VLLM,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="vLLM",
+            local=True,
+            default_base_url="http://127.0.0.1:8000/v1",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.LLAMA_CPP,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="llama.cpp server",
+            local=True,
+            default_base_url="http://127.0.0.1:8080/v1",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.SGLANG,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="SGLang",
+            local=True,
+            default_base_url="http://127.0.0.1:30000/v1",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.LM_STUDIO,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="LM Studio",
+            local=True,
+            default_base_url="http://127.0.0.1:1234/v1",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.HUGGINGFACE_ENDPOINT,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Hugging Face Inference Endpoint",
+            suggested_key_env="HF_TOKEN",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.NVIDIA_NIM,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="NVIDIA NIM",
+            support_tier="compatible",
+        ),
+        ProviderCatalogEntry(
+            flavor=ProviderFlavor.CUSTOM,
+            adapter=ProviderKind.OPENAI_COMPATIBLE,
+            display_name="Custom OpenAI-compatible endpoint",
+            support_tier="compatible",
+        ),
+    ]
+}
+
+
+class ProviderRegistry:
+    def __init__(self) -> None:
+        self._providers: dict[str, ModelProvider] = {}
+
+    def register(self, provider: ModelProvider, *, replace: bool = False) -> None:
+        if provider.config.id in self._providers and not replace:
+            raise ValueError(f"provider {provider.config.id!r} is already registered")
+        self._providers[provider.config.id] = provider
+
+    def get(self, provider_id: str) -> ModelProvider:
+        try:
+            provider = self._providers[provider_id]
+        except KeyError as exc:
+            record_caught_exception(
+                "providers",
+                "providers.providers.caught_failure_014",
+                "A handled providers operation raised an exception.",
+                exc,
+                stage="providers",
+            )
+            raise ProviderError(f"unknown provider {provider_id!r}") from exc
+        if not provider.config.enabled:
+            raise ProviderError(f"provider {provider_id!r} is disabled")
+        return provider
+
+    def select(
+        self,
+        *,
+        required: Iterable[str] = (),
+        local_only: bool = False,
+        residency: str | None = None,
+    ) -> ModelProvider:
+        for provider in self._providers.values():
+            if not provider.config.enabled:
+                continue
+            if local_only and not provider.config.local:
+                continue
+            if residency and provider.config.data_residency != residency:
+                continue
+            if provider.capabilities.supports(required):
+                return provider
+        raise UnsupportedCapability(
+            "no provider satisfies the requested policy and capabilities"
+        )
+
+    def route(self, request: ProviderRouteRequest) -> ModelProvider:
+        if request.local_only and not request.cloud_allowed:
+            cloud_allowed = False
+        else:
+            cloud_allowed = request.cloud_allowed
+        ordered = list(self._providers.values())
+        preference = {
+            value: index for index, value in enumerate(request.preferred_provider_ids)
+        }
+        ordered.sort(key=lambda item: preference.get(item.config.id, len(preference)))
+        for provider in ordered:
+            config = provider.config
+            if not config.enabled:
+                continue
+            if request.local_only and not config.local:
+                continue
+            if not cloud_allowed and not config.local:
+                continue
+            if request.residency and config.data_residency != request.residency:
+                continue
+            declared_cost = config.options.get("input_cost_per_million")
+            if request.max_input_cost_per_million is not None and (
+                declared_cost is None
+                or float(declared_cost) > request.max_input_cost_per_million
+            ):
+                continue
+            if not provider.capabilities.supports(request.required_capabilities):
+                continue
+            return provider
+        raise UnsupportedCapability(
+            "no provider satisfies the requested capabilities, privacy, residency, and budget"
+        )
+
+    async def health(self) -> list[ProviderHealth]:
+        return list(
+            await asyncio.gather(
+                *(provider.health() for provider in self._providers.values())
+            )
+        )
+
+    def public_configs(self) -> list[dict[str, Any]]:
+        return [provider.config.model_dump() for provider in self._providers.values()]
+
+
+def build_provider(
+    config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
+) -> ModelProvider:
+    implementations: dict[ProviderKind, type[ModelProvider]] = {
+        ProviderKind.OPENAI_RESPONSES: OpenAIResponsesProvider,
+        ProviderKind.OPENAI_COMPATIBLE: OpenAICompatibleProvider,
+        ProviderKind.ANTHROPIC: AnthropicProvider,
+        ProviderKind.GEMINI: GeminiProvider,
+        ProviderKind.BEDROCK: BedrockProvider,
+    }
+    return implementations[config.kind](config, transport=transport)
+
+
+def config_from_catalog(
+    *,
+    provider_id: str,
+    flavor: ProviderFlavor,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
+    api_key_value: SecretStr | None = None,
+    credential_ref: str | None = None,
+    capabilities: ModelCapabilities | None = None,
+    **overrides: Any,
+) -> ProviderConfig:
+    entry = PROVIDER_CATALOG[flavor]
+    endpoint = base_url or entry.default_base_url
+    if endpoint is None:
+        raise ValueError(f"{entry.display_name} requires an explicit endpoint")
+    options = dict(overrides.pop("options", {}))
+    local = bool(overrides.pop("local", entry.local)) or entry.local
+    if flavor == ProviderFlavor.AZURE_OPENAI:
+        options.setdefault("api_key_header", "api-key")
+        options.setdefault("api_key_scheme", "")
+    return ProviderConfig(
+        id=provider_id,
+        kind=entry.adapter,
+        flavor=flavor,
+        base_url=endpoint,
+        api_key_env=(
+            api_key_env or entry.suggested_key_env
+            if credential_ref is None
+            else api_key_env
+        ),
+        api_key_value=api_key_value,
+        credential_ref=credential_ref,
+        local=local,
+        capabilities=capabilities or ModelCapabilities(),
+        options=options,
+        **overrides,
+    )
+
+
+def provider_from_profile(
+    profile: ProviderProfile,
+    credential_resolver: Callable[[str], SecretStr] | None = None,
+) -> ModelProvider:
+    """Build a runtime adapter from a persisted, secret-safe provider profile."""
+
+    legacy_flavors = {
+        "openai-compatible": ProviderFlavor.CUSTOM.value,
+        "openai_compatible": ProviderFlavor.CUSTOM.value,
+        "openai-responses": ProviderFlavor.OPENAI.value,
+        "openai_responses": ProviderFlavor.OPENAI.value,
+    }
+    provider_type = legacy_flavors.get(profile.provider_type, profile.provider_type)
+    try:
+        flavor = ProviderFlavor(provider_type)
+    except ValueError as exc:
+        record_caught_exception(
+            "providers",
+            "providers.providers.caught_failure_015",
+            "A handled providers operation raised an exception.",
+            exc,
+            stage="providers",
+        )
+        raise ValueError(
+            f"unknown provider type {profile.provider_type!r}; "
+            "use provider-catalog values"
+        ) from exc
+    secret_env: str | None = None
+    secret_value: SecretStr | None = None
+    credential_ref: str | None = None
+    if profile.secret_ref:
+        if profile.secret_ref.startswith("env:"):
+            secret_env = profile.secret_ref.removeprefix("env:")
+        elif profile.secret_ref.startswith(("systemd:", "vault:", "session:")):
+            credential_ref = profile.secret_ref
+            if credential_resolver is not None:
+                secret_value = credential_resolver(profile.secret_ref)
+        else:
+            raise ValueError(
+                "provider secret_ref must use env:NAME, systemd:NAME, vault:ID, or session:ID"
+            )
+    raw_options = profile.metadata.get("options", {})
+    options = raw_options if isinstance(raw_options, dict) else {}
+    context_window = options.get("context_window")
+    max_output_tokens = options.get("max_output_tokens")
+    capabilities = ModelCapabilities(
+        streaming=profile.capabilities.streaming,
+        tools=profile.capabilities.tool_calling,
+        strict_tools=profile.capabilities.strict_structured_output,
+        parallel_tools=profile.capabilities.parallel_tool_calls,
+        structured_output=profile.capabilities.strict_structured_output,
+        vision=profile.capabilities.vision,
+        documents=profile.capabilities.documents,
+        audio=profile.capabilities.audio,
+        embeddings=profile.capabilities.embeddings,
+        reasoning_controls=profile.capabilities.reasoning_controls,
+        context_window=(
+            context_window
+            if isinstance(context_window, int) and not isinstance(context_window, bool)
+            else None
+        ),
+        max_output_tokens=(
+            max_output_tokens
+            if isinstance(max_output_tokens, int)
+            and not isinstance(max_output_tokens, bool)
+            else None
+        ),
+    )
+    default_model = profile.metadata.get("default_model") or next(
+        iter(profile.model_allowlist), None
+    )
+    config = config_from_catalog(
+        provider_id=profile.id,
+        flavor=flavor,
+        base_url=profile.endpoint,
+        api_key_env=secret_env,
+        api_key_value=secret_value,
+        credential_ref=credential_ref,
+        default_model=default_model,
+        model_allowlist=profile.model_allowlist,
+        capabilities=capabilities,
+        local=profile.is_local,
+        enabled=profile.enabled,
+        data_residency=(
+            profile.privacy.residency[0] if profile.privacy.residency else None
+        ),
+        data_retention=profile.privacy.retention,
+        options=options,
+    )
+    if profile.privacy.local_only and not config.local:
+        raise ValueError("a local-only privacy profile cannot use a cloud provider")
+    descriptors = profile.metadata.get("model_descriptors")
+    if isinstance(descriptors, list):
+        described = [
+            item
+            for item in descriptors
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        ]
+        config = config.model_copy(
+            update={
+                "model_parameters": {
+                    str(item["id"]): [
+                        str(value) for value in item.get("supported_parameters") or []
+                    ]
+                    for item in described
+                },
+                "reasoning_mandatory_models": [
+                    str(item["id"])
+                    for item in described
+                    if item.get("reasoning_mandatory") is True
+                ],
+                "model_prices": _catalog_prices(described),
+            }
+        )
+    return build_provider(config)
+
+
+def _catalog_prices(described: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Each described model's prices, as high as any endpoint serving it charges.
+
+    OpenRouter's model-level price is its cheapest endpoint's, and routing can
+    pick a dearer one (DeepSeek V4.1 Flash lists $0.035/M input while Together
+    serves it at $0.30/M). Where the model's endpoints were measured, each
+    unit takes the highest price among them, so an estimate is never below
+    the bill. An alias falls back to its target's prices.
+    """
+
+    def prices(item: dict[str, Any]) -> dict[str, str]:
+        routes = (
+            item.get("route_limits")
+            if route_limits_verified(item, str(item["id"]))
+            else None
+        )
+        peak: dict[str, tuple[Decimal, str]] = {}
+        for source in [
+            item.get("pricing"),
+            *(
+                route.get("pricing")
+                for route in (routes if isinstance(routes, list) else [])
+                if isinstance(route, dict)
+            ),
+        ]:
+            for unit, value in source.items() if isinstance(source, dict) else []:
+                if not isinstance(unit, str) or not isinstance(value, str):
+                    continue
+                try:
+                    price = Decimal(value)
+                except (
+                    InvalidOperation
+                ):  # diagnostic-expected: an unusable price is left out
+                    continue
+                if (
+                    price.is_finite()
+                    and price >= 0
+                    and (unit not in peak or price > peak[unit][0])
+                ):
+                    peak[unit] = (price, value)
+        return {unit: value for unit, (_, value) in peak.items()}
+
+    by_id = {str(item["id"]): prices(item) for item in described}
+    targets = {
+        str(item["id"]): item.get("alias_target")
+        for item in described
+        if isinstance(item.get("alias_target"), str)
+    }
+    return {
+        model: own or by_id.get(targets.get(model) or "", {})
+        for model, own in by_id.items()
+        if own or by_id.get(targets.get(model) or "")
+    }
+
+
+__all__ = [
+    "AnthropicProvider",
+    "BedrockProvider",
+    "GeminiProvider",
+    "ModelCapabilities",
+    "ModelMessage",
+    "ModelProvider",
+    "ModelRequest",
+    "ModelResponse",
+    "ModelToolResult",
+    "OpenAICompatibleProvider",
+    "OpenAIResponsesProvider",
+    "PROVIDER_CATALOG",
+    "ProviderCatalogEntry",
+    "ProviderConfig",
+    "ProviderError",
+    "ProviderCredentialLockedError",
+    "ProviderContextLengthError",
+    "ProviderOverloadedError",
+    "ProviderResponseError",
+    "ProviderFlavor",
+    "ProviderHealth",
+    "ProviderKind",
+    "ProviderRegistry",
+    "ProviderRouteRequest",
+    "RetryPolicy",
+    "ToolDefinition",
+    "UnsupportedCapability",
+    "build_provider",
+    "config_from_catalog",
+    "json_schema_instruction",
+    "provider_from_profile",
+    "retry_policy",
+    "usage_cost_usd",
+]

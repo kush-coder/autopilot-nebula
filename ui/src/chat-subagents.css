@@ -1,0 +1,131 @@
+/*
+ * Delegated subagents: the composer rail, the docked pane and the report card
+ * in the transcript. Status is always carried by a word, never by colour
+ * alone, and a child's own words are never restyled into a verdict.
+ */
+
+/* Rail: what is delegated, without taking the composer's room. */
+.chat-subagent-rail { display: flex; align-items: center; gap: 8px; min-height: 32px; margin: 2px 0 0 2px; padding: 2px 6px; border: 1px solid var(--border-soft); border-radius: 999px; color: var(--muted); font-size: 11px; }
+.chat-subagent-rail strong { color: var(--text); font-size: 11px; }
+.chat-subagent-counts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.chat-subagent-counts > span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.chat-subagent-rail > small { margin-left: auto; white-space: nowrap; }
+.chat-subagent-rail .icon-button { width: 28px; min-height: 28px; }
+.chat-subagent-dot { display: inline-block; width: 6px; height: 6px; border-radius: 999px; background: var(--muted); }
+[data-tone="running"] .chat-subagent-dot, .chat-subagent-dot[data-tone="running"] { background: var(--blue); }
+[data-tone="waiting_approval"] .chat-subagent-dot, .chat-subagent-dot[data-tone="waiting_approval"] { background: var(--status-warning); }
+[data-tone="recovering"] .chat-subagent-dot, .chat-subagent-dot[data-tone="recovering"] { background: var(--status-warning); }
+
+/* The parent owns a child's pending decision, so the request stays in the transcript. */
+.chat-subagent-attention { display: grid; width: 100%; max-width: var(--chat-reading-track); grid-template-columns: 18px minmax(0, 1fr) auto; align-items: start; gap: 12px; margin: 12px auto 24px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--status-warning) 38%, var(--border-soft)); border-radius: var(--radius-panel); background: color-mix(in srgb, var(--status-warning) 8%, var(--surface-muted)); }
+.chat-subagent-attention > svg { margin-top: 2px; color: var(--status-warning); }
+.chat-subagent-attention > div { display: grid; min-width: 0; gap: 4px; }
+.chat-subagent-attention strong { color: var(--text-strong); font-size: var(--type-reading); }
+.chat-subagent-attention p { margin: 0; color: var(--text); font-size: var(--type-secondary); overflow-wrap: anywhere; }
+.chat-subagent-attention small { color: var(--muted); font-size: var(--type-meta); overflow-wrap: anywhere; }
+.chat-subagent-attention .button { min-height: 44px; }
+@media (max-width: 760px) {
+  .chat-subagent-attention { grid-template-columns: 18px minmax(0, 1fr); }
+  .chat-subagent-attention .button { grid-column: 2; justify-self: start; }
+}
+
+/* Pane: one card per child, expanded while it needs something. */
+.chat-subagent-pane { display: grid; gap: 10px; min-width: 0; }
+.chat-subagent-pane-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chat-subagent-pane-header > div { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.chat-subagent-pane-header strong { font-size: 12px; }
+.chat-subagent-total { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--surface-raised); color: var(--muted); font-size: 11px; text-align: center; }
+.chat-subagent-slots { display: grid; gap: 4px; margin: 0; color: var(--muted); font-size: 11px; }
+.chat-subagent-slot-bar { display: block; height: 3px; border-radius: 999px; background: var(--surface-raised); overflow: hidden; }
+.chat-subagent-slot-bar > span { display: block; height: 100%; background: var(--blue); }
+.chat-subagent-error { margin: 0; color: var(--red); font-size: 11px; overflow-wrap: anywhere; }
+
+.chat-subagent-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.chat-subagent-card { border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface); }
+.chat-subagent-card[data-status="waiting_approval"] { border-color: var(--status-warning); }
+.chat-subagent-card-head { display: grid; grid-template-columns: 20px minmax(0, 1fr) 16px; align-items: start; gap: 8px; padding: 8px 10px; }
+.chat-subagent-card-icon { display: grid; place-items: center; color: var(--muted); }
+.chat-subagent-card-icon[data-status="running"] { color: var(--blue); }
+.chat-subagent-card-icon[data-status="completed"] { color: var(--green); }
+.chat-subagent-card-title { display: grid; gap: 2px; min-width: 0; padding: 0; border: 0; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.chat-subagent-card-title strong { font-size: 12px; overflow-wrap: anywhere; }
+.chat-subagent-card-title small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.chat-subagent-card-title:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 8px; }
+.chat-subagent-card-body { display: grid; gap: 8px; padding: 0 10px 10px; }
+
+.chat-subagent-steps { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.chat-subagent-steps li { display: grid; grid-template-columns: 16px auto minmax(0, 1fr); align-items: baseline; gap: 6px; font-size: 11px; }
+.chat-subagent-step-icon { color: var(--muted); }
+.chat-subagent-steps code { font-family: var(--font-mono); font-size: 11px; }
+.chat-subagent-steps small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-subagent-task, .chat-subagent-result { margin: 0; color: var(--text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+.chat-subagent-capabilities { display: grid; gap: 2px; margin: 0; color: var(--text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+
+.chat-subagent-approval { display: grid; gap: 6px; }
+.chat-subagent-approval p { margin: 0; font-size: 11px; overflow-wrap: anywhere; }
+.chat-subagent-approval pre { margin: 0; padding: 6px 8px; overflow: auto; border-radius: 8px; background: var(--surface-muted); }
+.chat-subagent-approval code { font-family: var(--font-mono); font-size: 11px; }
+.chat-subagent-approval-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-subagent-approval-actions .button { min-height: 32px; }
+
+.chat-subagent-card-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-subagent-card-actions .button, .chat-subagent-stop-all { min-height: 32px; }
+.chat-subagent-stop, .chat-subagent-stop-all { color: var(--red); }
+.chat-subagent-stop-all { justify-self: stretch; }
+.chat-subagent-note { margin: 0; color: var(--muted); font-size: 11px; }
+
+/* Report card, in the transcript where Core posted it. */
+.chat-subagent-transcript-group { width: 100%; max-width: var(--chat-reading-track); margin: 0 auto 28px; color: var(--text-secondary); }
+.chat-subagent-transcript-group > summary { min-height: 44px; padding: 11px 12px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-muted); cursor: pointer; overflow-wrap: anywhere; }
+.chat-subagent-transcript-group > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.chat-subagent-transcript-group > summary strong { margin-right: 8px; color: var(--text); font-size: 12px; }
+.chat-subagent-transcript-group > summary span { color: var(--muted); font-size: 12px; }
+.chat-subagent-transcript-group[open] > summary { margin-bottom: 8px; }
+.chat-subagent-transcript-group-results { display: grid; gap: 8px; }
+.chat-subagent-transcript-group-results > .chat-message { margin-bottom: 0; }
+.chat-subagent-result { display: grid; gap: 6px; margin: 8px 0; padding: 10px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-muted); }
+.chat-subagent-result > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.chat-subagent-result strong { font-size: 12px; }
+.chat-subagent-result-icon { color: var(--green); }
+.chat-subagent-result[data-status="failed"] .chat-subagent-result-icon,
+.chat-subagent-result[data-status="stopped"] .chat-subagent-result-icon,
+.chat-subagent-result[data-status="interrupted"] .chat-subagent-result-icon { color: var(--status-warning); }
+.chat-subagent-result-name { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.chat-subagent-result > header small { color: var(--muted); font-size: 11px; }
+.chat-subagent-result p { margin: 0; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-subagent-result-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-subagent-result-actions .button { min-height: 32px; }
+.chat-subagent-posted > summary { min-height: 44px; padding: 11px 4px; cursor: pointer; font-weight: 600; }
+.chat-subagent-posted > summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+@media (max-width: 760px), (pointer: coarse) {
+  .chat-subagent-rail .icon-button { width: 44px; min-height: 44px; }
+  .chat-subagent-approval-actions .button, .chat-subagent-card-actions .button,
+  .chat-subagent-stop-all, .chat-subagent-result-actions .button { min-height: 44px; }
+}
+
+/* Harness chats: the one provider model their subagents run on. */
+.chat-settings-capabilities > .chat-harness-subagents { display: grid; align-items: stretch; gap: 6px; }
+.chat-harness-subagents > .chat-knowledge-toggle { justify-self: start; }
+.chat-harness-subagent-status { color: var(--muted); font-size: 11px; }
+.chat-harness-subagent-status[data-tone="ok"] > span { color: var(--green); }
+.chat-harness-subagent-status[data-tone="error"] { color: var(--red); }
+
+/* The operator's optional running-at-once limit, beside its explanation. */
+.chat-settings-capabilities > .chat-provider-subagents { display: grid; align-items: stretch; gap: 6px; padding: 7px 9px; }
+.chat-provider-subagents > .chat-knowledge-toggle { justify-self: start; max-width: 100%; }
+.chat-provider-subagents > .chat-knowledge-toggle > span { min-width: 0; }
+.chat-subagent-effort > label, .chat-subagent-effort > small { grid-column: 1 / -1; }
+.chat-subagent-effort > small { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.chat-subagent-limit { align-items: end; }
+.chat-subagent-limit input { width: 100%; min-width: 0; height: 34px; padding: 0 9px; border: 1px solid var(--border-soft); border-radius: 8px; color: var(--text); background: color-mix(in srgb, var(--canvas) 72%, transparent); font-size: 12px; }
+.chat-subagent-limit input:hover:not(:disabled) { border-color: var(--border); }
+.chat-subagent-limit input:focus-visible { border-color: var(--focus); outline-offset: 1px; }
+.chat-subagent-limit input[aria-invalid="true"] { border-color: var(--red); }
+.chat-subagent-limit > small { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.chat-subagent-limit > small[data-tone="error"] { color: var(--red); }
+.chat-settings-floating .chat-subagent-limit input { height: 44px; }
+@media (hover: none), (pointer: coarse) {
+  .chat-subagent-limit input { height: var(--touch-target); }
+}
+.chat-subagent-result-model { overflow-wrap: anywhere; }

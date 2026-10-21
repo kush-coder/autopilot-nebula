@@ -1,0 +1,266 @@
+import { memo, useDeferredValue, useMemo, useRef, useState, type MouseEvent } from "react";
+import { Check, Copy, Play } from "lucide-react";
+import { Highlight, themes, type Language } from "prism-react-renderer";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type { ExecutionLanguage, ExecutionOrigin } from "../api/types";
+import { useOptionalResolvedTheme } from "../state/ThemeContext";
+import {
+  parseExactFences,
+  sha256,
+  utf8Length,
+  type ExactFence,
+} from "./assistantCode";
+import { logCaughtDiagnostic } from "../diagnostics";
+import { copySelectionText } from "./selection/selectionActions";
+import { webLink, workspaceLink, type WorkspaceLink } from "./assistantLinks";
+
+export interface FencedRunCandidate {
+  source: string;
+  language: ExecutionLanguage;
+  declaredLanguage: string;
+  origin: ExecutionOrigin;
+}
+
+interface AssistantMarkdownProps {
+  content: string;
+  messageId?: string;
+  durable: boolean;
+  streaming?: boolean;
+  runnableLanguages: ReadonlySet<ExecutionLanguage>;
+  onRun: (candidate: FencedRunCandidate) => void;
+  onRunInTerminal?: (candidate: FencedRunCandidate) => void;
+  workspacePath?: string;
+  onOpenFile?: (file: WorkspaceLink) => void;
+  onOpenWebLink?: (url: string) => void;
+  /** Fences before a separately displayed final answer still count in Core's saved message. */
+  blockOrdinalOffset?: number;
+}
+
+function safeUrl(value: string): string {
+  if (value.startsWith("#")) return value;
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:", "mailto:"].includes(parsed.protocol) ? value : "";
+  } catch (caughtError) {
+    void logCaughtDiagnostic("interface.assistant_markdown.caught_failure_01", "A handled interface operation failed.", caughtError, "assistant_markdown");
+    return "";
+  }
+}
+
+function openSafeLink(event: MouseEvent<HTMLAnchorElement>, href?: string, file?: WorkspaceLink, onOpenFile?: (file: WorkspaceLink) => void, onOpenWebLink?: (url: string) => void) {
+  if (!href) {
+    event.preventDefault();
+    return;
+  }
+  if (href.startsWith("#")) return;
+  event.preventDefault();
+  if (file && onOpenFile) { onOpenFile(file); return; }
+  if (webLink(href) && onOpenWebLink) { onOpenWebLink(href); return; }
+  globalThis.open(href, "_blank", "noopener,noreferrer");
+}
+
+function selectedOffsets(element: HTMLElement, source: string): { start: number; end: number } | undefined {
+  const selection = globalThis.getSelection?.();
+  if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return undefined;
+  const range = selection.getRangeAt(0);
+  if (!element.contains(range.startContainer) || !element.contains(range.endContainer)) return undefined;
+  const prefix = document.createRange();
+  prefix.selectNodeContents(element);
+  prefix.setEnd(range.startContainer, range.startOffset);
+  const selected = document.createRange();
+  selected.selectNodeContents(element);
+  selected.setStart(range.startContainer, range.startOffset);
+  selected.setEnd(range.endContainer, range.endOffset);
+  const start = prefix.toString().length;
+  const end = start + selected.toString().length;
+  if (end <= start || source.slice(start, end) !== selected.toString()) return undefined;
+  return { start, end };
+}
+
+function FencedCode({
+  block,
+  canRun,
+  messageId,
+  onRun,
+  onRunInTerminal,
+  blockOrdinalOffset = 0,
+}: {
+  block: ExactFence;
+  canRun: boolean;
+  messageId?: string;
+  onRun: (candidate: FencedRunCandidate) => void;
+  onRunInTerminal?: (candidate: FencedRunCandidate) => void;
+  blockOrdinalOffset?: number;
+}) {
+  const codeRef = useRef<HTMLElement>(null);
+  const selectionRef = useRef<{ start: number; end: number } | undefined>(undefined);
+  const [feedback, setFeedback] = useState("");
+  // Token colors follow the app theme; the block's own surface supplies the background.
+  const resolvedTheme = useOptionalResolvedTheme();
+  const lightTheme = !resolvedTheme || resolvedTheme === "light" || resolvedTheme === "zero-light";
+  const language = (block.canonicalLanguage === "sh" ? "bash" : block.canonicalLanguage ?? "text") as Language;
+  const lineBreaks = block.source.match(/\r\n|\r|\n/g) ?? [];
+  const lineCount = Math.max(1, lineBreaks.length + (/(?:\r\n|\r|\n)$/.test(block.source) ? 0 : 1));
+
+  const slice = () => {
+    const current = codeRef.current ? selectedOffsets(codeRef.current, block.source) : undefined;
+    if (current) selectionRef.current = current;
+    const selected = current ?? selectionRef.current;
+    return {
+      source: selected ? block.source.slice(selected.start, selected.end) : block.source,
+      selectionStartByte: selected ? utf8Length(block.source.slice(0, selected.start)) : undefined,
+      selectionEndByte: selected ? utf8Length(block.source.slice(0, selected.end)) : undefined,
+    };
+  };
+
+  const captureSelection = () => {
+    const selected = codeRef.current ? selectedOffsets(codeRef.current, block.source) : undefined;
+    if (selected) selectionRef.current = selected;
+  };
+
+  const copy = async () => {
+    const selected = slice();
+    try {
+      await copySelectionText(selected.source);
+      setFeedback("Copied exact source");
+      globalThis.setTimeout(() => setFeedback(""), 1800);
+    } catch (error) {
+      // diagnostic-expected: clipboard denial is shown beside the retryable copy control.
+      setFeedback(error instanceof Error ? error.message : "Copy failed. Select the code and copy it manually.");
+    }
+  };
+
+  const run = async () => {
+    if (!block.canonicalLanguage || !messageId) return;
+    const selected = slice();
+    const blockSha256 = await sha256(block.source);
+    const candidate = {
+      source: selected.source,
+      language: block.canonicalLanguage,
+      declaredLanguage: block.declaredLanguage,
+      origin: {
+        kind: "assistant_message",
+        messageId,
+        blockOrdinal: block.ordinal + blockOrdinalOffset,
+        blockSha256,
+        selectionStartByte: selected.selectionStartByte,
+        selectionEndByte: selected.selectionEndByte,
+      },
+    } satisfies FencedRunCandidate;
+    if (["bash", "sh"].includes(candidate.language) && onRunInTerminal) onRunInTerminal(candidate);
+    else onRun(candidate);
+  };
+
+  return (
+    <div className="assistant-code-block">
+      <header>
+        <span>{block.declaredLanguage || "code"}</span>
+        <div>
+          <button type="button" onMouseDown={captureSelection} onClick={() => void copy()} aria-label="Copy exact code">
+            {feedback === "Copied exact source" ? <Check size={13} /> : <Copy size={13} />} Copy
+          </button>
+          {canRun && (
+            <button className="run-code" type="button" onMouseDown={captureSelection} onClick={() => void run()} aria-label={["bash", "sh"].includes(block.canonicalLanguage ?? "") && onRunInTerminal ? `Run ${block.canonicalLanguage} code in terminal` : `Review and run ${block.canonicalLanguage} code`}>
+              <Play size={13} /> {["bash", "sh"].includes(block.canonicalLanguage ?? "") && onRunInTerminal ? "Run in terminal" : "Run"}
+            </button>
+          )}
+        </div>
+      </header>
+      <Highlight theme={lightTheme ? themes.github : themes.vsDark} code={block.source} language={language}>
+        {({ style, tokens, getLineProps, getTokenProps }) => (
+          <pre style={{ ...style, backgroundColor: undefined }}>
+            <code ref={codeRef} onMouseUp={captureSelection}>
+              {tokens.slice(0, lineCount).map((line, lineIndex) => (
+                <span {...getLineProps({ line })} className="assistant-code-line" key={lineIndex}>
+                  {line.map((token, tokenIndex) => (
+                    <span {...getTokenProps({ token })} key={tokenIndex} />
+                  ))}
+                  {lineBreaks[lineIndex] ?? ""}
+                </span>
+              ))}
+            </code>
+          </pre>
+        )}
+      </Highlight>
+      <span className={feedback === "Copied exact source" ? "sr-only" : "inline-error"} role="status" aria-live="polite">{feedback}</span>
+    </div>
+  );
+}
+
+export const AssistantMarkdown = memo(function AssistantMarkdown({
+  content,
+  messageId,
+  durable,
+  streaming = false,
+  runnableLanguages,
+  onRun,
+  onRunInTerminal,
+  workspacePath,
+  onOpenFile,
+  onOpenWebLink,
+  blockOrdinalOffset = 0,
+}: AssistantMarkdownProps) {
+  // Keep newly received text visible immediately while React schedules the
+  // more expensive Markdown/fence pass behind input and scroll interactions.
+  const deferredContent = useDeferredValue(content);
+  const formattedContent = streaming && content.startsWith(deferredContent) ? deferredContent : content;
+  const pendingText = streaming ? content.slice(formattedContent.length) : "";
+  const parsed = useMemo(() => parseExactFences(formattedContent), [formattedContent]);
+  const renderable = parsed.unmatchedStart === undefined ? formattedContent : formattedContent.slice(0, parsed.unmatchedStart);
+  const unmatched = parsed.unmatchedStart === undefined ? "" : formattedContent.slice(parsed.unmatchedStart);
+  const components: Components = useMemo(() => {
+    const claimed = new Set<number>();
+    return {
+      pre: ({ children }) => <>{children}</>,
+      code: ({ node, className, children, ...properties }) => {
+      const offset = node?.position?.start.offset;
+      let block = parsed.blocks.find((candidate) => candidate.openStart === offset);
+      if (!block && className?.startsWith("language-")) {
+        const rendered = String(children);
+        block = parsed.blocks.find((candidate) => !claimed.has(candidate.ordinal)
+          && (candidate.source === rendered || candidate.source.replace(/\n$/, "") === rendered.replace(/\n$/, "")));
+      }
+      if (block) {
+        claimed.add(block.ordinal);
+        return (
+          <FencedCode
+            block={block}
+            messageId={messageId}
+            canRun={Boolean(durable && messageId && block.canonicalLanguage && runnableLanguages.has(block.canonicalLanguage))}
+            onRun={onRun}
+            onRunInTerminal={onRunInTerminal}
+            blockOrdinalOffset={blockOrdinalOffset}
+          />
+        );
+      }
+      return <code className={className} {...properties}>{children}</code>;
+      },
+      img: () => null,
+    // GFM task-list boxes are read-only state; name it so the box is not an
+    // unlabelled control to a screen reader.
+      input: ({ node: _node, ...properties }) => properties.type === "checkbox"
+      ? <input {...properties} aria-label={properties.checked ? "Done" : "To do"} />
+      : <input {...properties} />,
+      a: ({ node: _node, href, children, ...properties }) => {
+      const file = href && onOpenFile ? workspaceLink(href, workspacePath) : undefined;
+      const safe = file ? href! : href ? safeUrl(href) : "";
+      return <a {...properties} href={safe || undefined} rel="noopener noreferrer" onClick={(event) => openSafeLink(event, safe, file, onOpenFile, onOpenWebLink)}>{children}</a>;
+      },
+    };
+  }, [parsed, durable, messageId, runnableLanguages, onRun, onRunInTerminal, blockOrdinalOffset, onOpenFile, onOpenWebLink, workspacePath]);
+
+  const formattedNode = useMemo(() => renderable ? (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={(url) => onOpenFile && workspaceLink(url, workspacePath) ? url : safeUrl(url)}>
+      {renderable}
+    </ReactMarkdown>
+  ) : null, [renderable, components, onOpenFile, workspacePath]);
+
+  return (
+    <div className={`assistant-markdown${streaming ? " streaming" : ""}`}>
+      {formattedNode}
+      {unmatched && <pre className="assistant-inert-fence">{unmatched}{pendingText}</pre>}
+      {!unmatched && pendingText && <span className="assistant-stream-pending">{pendingText}</span>}
+    </div>
+  );
+});

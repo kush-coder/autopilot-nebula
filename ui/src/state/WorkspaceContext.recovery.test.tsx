@@ -1,0 +1,336 @@
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useLayoutEffect } from "react";
+import { WorkspaceProvider, useWorkspace, useWorkspaceEvents, useWorkspaceMissions } from "./WorkspaceContext";
+
+const fixture = vi.hoisted(() => ({ methods: {} as Record<string, ReturnType<typeof vi.fn>>, streams: [] as Array<any>, onCommit: undefined as (() => void) | undefined, coreCommits: 0, errors: [] as string[] }));
+vi.mock("../api/runtime", () => ({ resolveApiRuntime: async () => ({ state: "ready", baseUrl: "http://core/api/v1" }) }));
+vi.mock("../api/client", () => ({ ApiClient: class {
+  baseUrl = "http://core/api/v1";
+  constructor() { Object.assign(this, fixture.methods); }
+} }));
+vi.mock("../api/events", () => ({ NebulaEventStream: class {
+  options: any;
+  constructor(options: any) { this.options = options; fixture.streams.push(this); }
+  connect() { this.options.onStateChange("connecting"); }
+  disconnect() { this.options.onStateChange("closed"); }
+} }));
+vi.mock("../diagnostics", () => ({ logCaughtDiagnostic: vi.fn(), setCoreDiagnosticsHealth: vi.fn() }));
+
+const run = (id = "run-1", completedTasks = 2) => ({ id, engagementId: "project", title: id, status: "running", completedTasks, totalTasks: 5, updatedAt: "2026-09-09T12:00:00Z" });
+function Probe() {
+  const value = useWorkspace();
+  const events = useWorkspaceEvents();
+  const missions = useWorkspaceMissions();
+  useLayoutEffect(() => { fixture.onCommit?.(); });
+  return <><output data-testid="state">{JSON.stringify({
+    workspace: value.workspaceState, status: value.resourceStatus,
+    library: value.libraryItems, harnesses: value.harnesses, assets: value.assets,
+    run: missions.run, runs: missions.runs, events,
+    approvals: value.approvals, evidence: value.evidence, engagement: value.engagement?.id,
+    observations: value.observations,
+  })}</output>{(["library", "harnesses", "activity", "evidence"] as const).map((resource) =>
+    <button key={resource} onClick={() => void value.retryResource(resource).catch(() => {})}>Retry {resource}</button>)}
+  <button onClick={() => value.selectEngagement("project-b")}>Select project B</button>
+  <button onClick={() => value.selectEngagement("project")}>Select project A</button>
+  <button onClick={() => missions.selectMission("run-2")}>Select mission 2</button>
+  <button onClick={value.reconnect}>Retry Core</button>
+  <button onClick={() => void value.resolveApproval(value.approvals[0]?.id ?? "", { decision: "approve" }).catch((error: Error) => fixture.errors.push(error.message))}>Approve first</button></>;
+}
+const state = () => JSON.parse(screen.getByTestId("state").textContent!);
+function CoreOnlyProbe() {
+  useWorkspace();
+  useLayoutEffect(() => { fixture.coreCommits += 1; });
+  return null;
+}
+const mount = async () => {
+  render(<WorkspaceProvider><Probe /><CoreOnlyProbe /></WorkspaceProvider>);
+  await waitFor(() => expect(["ready", "degraded"]).toContain(state().workspace));
+};
+
+beforeEach(() => {
+  fixture.onCommit = undefined;
+  fixture.streams.length = 0;
+  fixture.errors.length = 0;
+  fixture.coreCommits = 0;
+  vi.restoreAllMocks();
+  localStorage.clear();
+  window.history.replaceState({}, "", "/");
+  localStorage.setItem("nebula.engagement", "project");
+  fixture.methods = Object.fromEntries([
+    "listApprovals", "listAssets", "listFindings", "listEvidence", "listObservations", "listKnowledgeSources", "listReports", "listLibraryItems", "listProviders",
+  ].map((name) => [name, vi.fn().mockResolvedValue({ items: [] })]));
+  Object.assign(fixture.methods, {
+    getToken: vi.fn(), health: vi.fn().mockResolvedValue({ status: "ok" }),
+    listEngagements: vi.fn().mockResolvedValue({ items: [{ id: "project", name: "Project", status: "active" }] }),
+    listHarnesses: vi.fn().mockResolvedValue([]), listProviderCatalog: vi.fn().mockResolvedValue([]),
+    listOperatorProfiles: vi.fn().mockResolvedValue([]),
+    setupStatus: vi.fn().mockResolvedValue({ core: { status: "ready" }, terminal: { status: "ready" } }),
+    listRuns: vi.fn().mockResolvedValue({ items: [run()] }),
+  });
+});
+
+describe("workspace resource recovery", () => {
+  it("makes the selected project ready while evidence is still loading", async () => {
+    let finishEvidence!: (value: unknown) => void;
+    fixture.methods.listEvidence.mockImplementationOnce(() => new Promise((resolve) => { finishEvidence = resolve; }));
+    fixture.methods.listObservations.mockResolvedValue({ items: [{ id: "note-1", title: "Ready note" }] });
+
+    render(<WorkspaceProvider><Probe /></WorkspaceProvider>);
+    await waitFor(() => expect(state().engagement).toBe("project"));
+    await waitFor(() => expect(state().status.notes.state).toBe("ready"));
+    expect(state().observations).toEqual([{ id: "note-1", title: "Ready note" }]);
+    expect(state().status.evidence.state).toBe("loading");
+    expect(state().workspace).toBe("ready");
+    expect(state().evidence).toEqual([]);
+    expect(fixture.methods.listObservations).toHaveBeenCalledTimes(1);
+
+    await act(async () => finishEvidence({ items: [{ id: "evidence-1" }] }));
+    await waitFor(() => expect(state().evidence).toEqual([{ id: "evidence-1" }]));
+    expect(state().status.evidence.state).toBe("ready");
+  });
+
+  it("shows an evidence failure after startup and restores the collection on retry", async () => {
+    let failEvidence!: (error: Error) => void;
+    fixture.methods.listEvidence.mockImplementationOnce(() => new Promise((_, reject) => { failEvidence = reject; }));
+
+    render(<WorkspaceProvider><Probe /></WorkspaceProvider>);
+    await waitFor(() => expect(state().workspace).toBe("ready"));
+    expect(state().status.evidence.state).toBe("loading");
+
+    await act(async () => failEvidence(new Error("Evidence listing stopped")));
+    await waitFor(() => expect(state().status.evidence.state).toBe("failed"));
+    expect(state().workspace).toBe("degraded");
+
+    fixture.methods.listEvidence.mockResolvedValueOnce({ items: [{ id: "recovered-evidence" }] });
+    fireEvent.click(screen.getByText("Retry evidence"));
+    await waitFor(() => expect(state().evidence).toEqual([{ id: "recovered-evidence" }]));
+    expect(state().status.evidence.state).toBe("ready");
+    await waitFor(() => expect(state().workspace).toBe("ready"));
+  });
+
+  it("shows a selected project before its resources finish and does not reload global catalogs", async () => {
+    fixture.methods.listEngagements.mockResolvedValue({ items: [
+      { id: "project", name: "Project A", status: "active" },
+      { id: "project-b", name: "Project B", status: "active" },
+    ] });
+    await mount();
+    let finishAssets!: (value: unknown) => void;
+    fixture.methods.listAssets.mockImplementationOnce(() => new Promise((resolve) => { finishAssets = resolve; }));
+
+    fireEvent.click(screen.getByText("Select project B"));
+    expect(state().engagement).toBe("project-b");
+    expect(state().workspace).toBe("ready");
+    expect(state().assets).toEqual([]);
+    await waitFor(() => expect(fixture.methods.listAssets).toHaveBeenCalledTimes(2));
+    expect(fixture.methods.health).toHaveBeenCalledTimes(1);
+    expect(fixture.methods.listEngagements).toHaveBeenCalledTimes(1);
+    expect(fixture.methods.listProviders).toHaveBeenCalledTimes(1);
+
+    await act(async () => finishAssets({ items: [{ id: "asset-b" }] }));
+    await waitFor(() => expect(state().assets).toEqual([{ id: "asset-b" }]));
+    fireEvent.click(screen.getByText("Select project A"));
+    expect(state().engagement).toBe("project");
+    expect(state().assets).toEqual([]);
+    await waitFor(() => expect(fixture.methods.listAssets).toHaveBeenCalledTimes(3));
+    expect(fixture.methods.listEngagements).toHaveBeenCalledTimes(1);
+
+    let finishStaleAssets!: (value: unknown) => void;
+    fixture.methods.listAssets.mockImplementationOnce(() => new Promise((resolve) => { finishStaleAssets = resolve; }));
+    fireEvent.click(screen.getByText("Select project B"));
+    await waitFor(() => expect(fixture.methods.listAssets).toHaveBeenCalledTimes(4));
+    fireEvent.click(screen.getByText("Select project A"));
+    await act(async () => finishStaleAssets({ items: [{ id: "stale-b" }] }));
+    expect(state().engagement).toBe("project");
+    expect(state().assets).toEqual([]);
+  });
+
+  it("switches missions and their event streams without reloading the project", async () => {
+    localStorage.setItem("nebula.mission", "run-1");
+    fixture.methods.listRuns.mockResolvedValue({ items: [run("run-1"), run("run-2")] });
+    fixture.methods.listAssets.mockResolvedValue({ items: [{ id: "asset-1" }] });
+    await mount();
+    await waitFor(() => expect(state().run?.id).toBe("run-1"));
+    await waitFor(() => expect(fixture.streams.at(-1)?.options.cursor.runId).toBe("run-1"));
+    const listCalls = fixture.methods.listRuns.mock.calls.length;
+    const assetCalls = fixture.methods.listAssets.mock.calls.length;
+
+    fireEvent.click(screen.getByText("Select mission 2"));
+    await waitFor(() => expect(state().run?.id).toBe("run-2"));
+    await waitFor(() => expect(fixture.streams.at(-1)?.options.cursor.runId).toBe("run-2"));
+    expect(state().assets).toEqual([{ id: "asset-1" }]);
+    expect(fixture.methods.listRuns).toHaveBeenCalledTimes(listCalls);
+    expect(fixture.methods.listAssets).toHaveBeenCalledTimes(assetCalls);
+    expect(fixture.methods.health).toHaveBeenCalledTimes(1);
+    expect(fixture.methods.listEngagements).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a queued catalog-health effect overwrite observed connection loss", async () => {
+    await mount();
+    fixture.methods.listLibraryItems.mockResolvedValue({items: [{id: "refreshed"}]});
+    fixture.onCommit = () => {
+      if (state().library[0]?.id !== "refreshed") return;
+      fixture.onCommit = undefined;
+      window.dispatchEvent(new Event("offline"));
+    };
+    fireEvent.click(screen.getByText("Retry library"));
+    await waitFor(() => expect(state().library).toEqual([{id: "refreshed"}]));
+    expect(state().workspace).toBe("failed");
+    act(() => window.dispatchEvent(new Event("online")));
+    await waitFor(() => expect(state().workspace).toBe("ready"));
+  });
+
+  it("reconnects after a browser network transition without discarding the selected workspace", async () => {
+    window.history.replaceState({}, "", "/?mission=run-1");
+    fixture.methods.listLibraryItems.mockResolvedValue({items: [{id: "retained"}]});
+    await mount();
+    act(() => window.dispatchEvent(new Event("offline")));
+    await waitFor(() => expect(state().workspace).toBe("failed"));
+    expect(state().library).toEqual([{id: "retained"}]);
+    act(() => window.dispatchEvent(new Event("online")));
+    await waitFor(() => expect(state().workspace).toBe("ready"));
+    expect(state().run.id).toBe("run-1");
+    expect(new URLSearchParams(location.search).get("mission")).toBe("run-1");
+    expect(fixture.methods.health).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps health polling armed after an offline retry fails", async () => {
+    await mount();
+    act(() => window.dispatchEvent(new Event("offline")));
+    await waitFor(() => expect(state().workspace).toBe("failed"));
+    fixture.methods.health.mockRejectedValueOnce(new Error("Core remains offline"));
+    fireEvent.click(screen.getByText("Retry Core"));
+    await waitFor(() => expect(state().workspace).toBe("failed"));
+    act(() => window.dispatchEvent(new Event("online")));
+    await waitFor(() => expect(state().workspace).toBe("ready"));
+    expect(state().engagement).toBe("project");
+    expect(fixture.methods.health).toHaveBeenCalledTimes(4);
+  });
+
+  it("retries the global Library even without a selected project", async () => {
+    fixture.methods.listEngagements.mockResolvedValue({ items: [] });
+    fixture.methods.listLibraryItems.mockRejectedValueOnce(new Error("temporary"));
+    await mount();
+    expect(state().status.library.state).toBe("failed");
+    fixture.methods.listLibraryItems.mockResolvedValue({ items: [{ id: "library-item" }] });
+    fireEvent.click(screen.getByText("Retry library"));
+    await waitFor(() => expect(state().library).toEqual([{ id: "library-item" }]));
+    expect(fixture.methods.listLibraryItems).toHaveBeenCalledTimes(2);
+    expect(state().status.library.state).toBe("ready");
+    expect(state().workspace).toBe("ready");
+  });
+
+  it("exposes a failed harness catalog and restores its choices on retry", async () => {
+    fixture.methods.listHarnesses.mockRejectedValueOnce(new Error("catalog unavailable"));
+    await mount();
+    expect(state().workspace).toBe("degraded");
+    expect(state().status.harnesses.state).toBe("failed");
+    fixture.methods.listHarnesses.mockResolvedValue([{ id: "harness" }]);
+    fireEvent.click(screen.getByText("Retry harnesses"));
+    await waitFor(() => expect(state().harnesses).toEqual([{ id: "harness" }]));
+    expect(state().status.harnesses.state).toBe("ready");
+    expect(state().workspace).toBe("ready");
+  });
+
+  it("restores mission history, URL selection, and the stream after activity fails", async () => {
+    window.history.replaceState({}, "", "/?mission=run-1");
+    fixture.methods.listRuns.mockRejectedValueOnce(new Error("unavailable"));
+    await mount();
+    expect(state().runs).toEqual([]);
+    expect(fixture.streams).toHaveLength(0);
+    fixture.methods.listRuns.mockResolvedValue({ items: [run(), run("run-2")] });
+    fireEvent.click(screen.getByText("Retry activity"));
+    await waitFor(() => expect(fixture.streams).toHaveLength(1));
+    expect(state().runs).toHaveLength(2);
+    expect(state().run.id).toBe("run-1");
+    expect(fixture.streams[0].options.cursor.runId).toBe("run-1");
+    expect(new URLSearchParams(location.search).get("mission")).toBe("run-1");
+  });
+});
+
+describe("mission snapshot and replay integration", () => {
+  const completion = { id: "event", runId: "run-1", kind: "task.completed", sequence: 3, occurredAt: "2026-09-09T11:00:00Z", payload: {} };
+  it("keeps unrelated workspace consumers stable during event and mission updates", async () => {
+    await mount();
+    await waitFor(() => expect(fixture.streams).toHaveLength(1));
+    const before = fixture.coreCommits;
+    const stream = fixture.streams[0];
+    act(() => stream.options.onEvent({ ...completion, kind: "tool.output" }));
+    expect(state().events).toHaveLength(1);
+    expect(fixture.coreCommits).toBe(before);
+    fixture.methods.listRuns.mockResolvedValue({ items: [run("run-1", 3)] });
+    await act(async () => stream.options.onReplayComplete());
+    await waitFor(() => expect(state().run.completedTasks).toBe(3));
+    expect(fixture.coreCommits).toBe(before);
+  });
+
+  it("keeps historical replay out of snapshot counters and refreshes on live progress", async () => {
+    await mount();
+    await waitFor(() => expect(fixture.streams).toHaveLength(1));
+    const stream = fixture.streams.at(-1)!;
+    act(() => stream.options.onEvent(completion));
+    expect(state().run.completedTasks).toBe(2);
+    expect(state().run.updatedAt).toBe("2026-09-09T12:00:00Z");
+    await act(async () => stream.options.onReplayComplete());
+    expect(state().run.completedTasks).toBe(2);
+    fixture.methods.listRuns.mockResolvedValue({ items: [run("run-1", 3)] });
+    await act(async () => stream.options.onEvent({ ...completion, sequence: 4, kind: "run.progress" }));
+    expect(state().run.completedTasks).toBe(3);
+    expect(state().runs[0].completedTasks).toBe(3);
+    act(() => stream.options.onStateChange("reconnecting"));
+    act(() => stream.options.onEvent(completion));
+    expect(state().run.completedTasks).toBe(3);
+    await act(async () => stream.options.onReplayComplete());
+    expect(state().run.completedTasks).toBe(3);
+  });
+
+  it("refetches when another event arrives during a snapshot request", async () => {
+    await mount();
+    await waitFor(() => expect(fixture.streams).toHaveLength(1));
+    const stream = fixture.streams.at(-1)!;
+    let finish!: (value: unknown) => void;
+    fixture.methods.listRuns.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    act(() => stream.options.onReplayComplete());
+    act(() => stream.options.onEvent({ ...completion, kind: "run.progress" }));
+    fixture.methods.listRuns.mockResolvedValue({ items: [run("run-1", 4)] });
+    await act(async () => finish({ items: [run("run-1", 3)] }));
+    await waitFor(() => expect(state().run.completedTasks).toBe(4));
+  });
+});
+
+describe("offline and stale-link safety", () => {
+  it("keeps an approval card when the decision cannot reach Core", async () => {
+    fixture.methods.listApprovals.mockResolvedValue({ items: [{ id: "approval-1", status: "pending", toolName: "nmap" }] });
+    fixture.methods.decideApproval = vi.fn().mockResolvedValue({ id: "approval-1", status: "approved" });
+    await mount();
+    expect(state().approvals).toHaveLength(1);
+    act(() => window.dispatchEvent(new Event("offline")));
+    await waitFor(() => expect(state().workspace).toBe("failed"));
+
+    fireEvent.click(screen.getByText("Approve first"));
+
+    await waitFor(() => expect(fixture.errors).toEqual(["Nebula Core must be online to decide an approval."]));
+    expect(state().approvals).toHaveLength(1);
+    expect(fixture.methods.decideApproval).not.toHaveBeenCalled();
+  });
+
+  it("keeps the remembered project when a link names an archived project", async () => {
+    window.history.replaceState({}, "", "/projects/archived/findings");
+    fixture.methods.listEngagements.mockResolvedValue({ items: [
+      { id: "project", name: "Project", status: "active" },
+      { id: "archived", name: "Archived", status: "archived" },
+    ] });
+    await mount();
+    expect(state().engagement).toBeUndefined();
+    expect(localStorage.getItem("nebula.engagement")).toBe("project");
+  });
+
+  it("starts without browser storage", async () => {
+    const blocked = () => { throw new DOMException("Storage is blocked.", "SecurityError"); };
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(blocked);
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(blocked);
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(blocked);
+    await mount();
+    expect(state().engagement).toBe("project");
+  });
+});

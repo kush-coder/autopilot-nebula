@@ -1,0 +1,292 @@
+:root {
+  color-scheme: dark;
+
+  /* Product scale: typography, spacing, shape, layout, and motion. */
+  --type-body: 14px;
+  --type-reading: 15px;
+  --type-control: 13px;
+  --type-secondary: 12px;
+  --type-meta: 11px;
+  --type-title-sm: 16px;
+  --type-title-md: 20px;
+  --type-title-lg: 28px;
+  --leading-body: 1.6;
+  --leading-ui: 1.45;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --radius-control: 8px;
+  --radius-panel: 10px;
+  --radius-dialog: 16px;
+  --radius-sheet: 16px;
+  --control-height-compact: 32px;
+  --control-height: 36px;
+  --touch-target: 44px;
+  --content-track: 1200px;
+  --settings-track: 1040px;
+  --reading-track: 720px;
+  --chat-reading-track: 840px;
+  --dialog-track: 560px;
+  --motion-fast: 120ms;
+  --motion-standard: 180ms;
+  --motion-ease: cubic-bezier(.2, .72, .2, 1);
+  --font-ui: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Three visual depths: canvas, surface, and raised overlay. */
+  --canvas: #0b111a;
+  --surface: #111b27;
+  --surface-muted: #172230;
+  --surface-raised: #1c2a39;
+  /* Overlapping text needs an opaque plane even in translucent themes. */
+  --surface-overlay: var(--surface-raised);
+  --surface-hover: #26374a;
+  --text: #e4edf7;
+  --text-strong: #f4f8fc;
+  --muted: #a6b8ca;
+  --muted-strong: #bdcddd;
+  --border: #35475b;
+  --border-soft: #253649;
+  --blue: #6aa8eb;
+  --blue-bright: #87d7ff;
+  --blue-muted: rgb(106 168 235 / 12%);
+  --green: #55b887;
+  --green-muted: #123429;
+  --violet: #b493ff;
+  --yellow: #f2c76c;
+  --orange: #d49a5b;
+  --red: #e06e72;
+  --red-muted: #3c1c28;
+  --focus: #8fc5ff;
+  --on-accent: #071827;
+  --on-danger: #180405;
+  --action-primary: color-mix(in srgb, var(--blue) 50%, var(--surface-raised));
+  --action-primary-hover: color-mix(in srgb, var(--blue) 52%, var(--surface-raised));
+  --action-primary-pressed: color-mix(in srgb, var(--blue) 46%, var(--surface-raised));
+  --action-primary-text: #f4f8fc;
+  --overlay-scrim: rgb(0 0 0 / 42%);
+  --brand-start: #4f9df7;
+  --brand-end: #7067d9;
+  --shadow: 0 18px 48px rgb(0 0 0 / 38%);
+  --shadow-overlay: var(--shadow);
+  /* Dims everything outside the control a guide step points at. */
+  --shadow-guide-spotlight: 0 0 0 200vmax rgb(4 6 9 / 62%);
+  --shadow-panel: none;
+
+  --status-info: var(--blue);
+  --status-info-surface: color-mix(in srgb, var(--blue) 8%, var(--surface-raised));
+  --status-warning: var(--orange);
+  --status-warning-surface: color-mix(in srgb, var(--orange) 9%, var(--surface-raised));
+  --status-error: var(--red);
+  --status-error-surface: color-mix(in srgb, var(--red) 10%, var(--surface-raised));
+  --status-blocking-surface: color-mix(in srgb, var(--red) 17%, var(--surface-raised));
+
+  /* Code tokens. The editor reads these through CSS variables so one
+     highlight style serves every theme. Dark values sit on --canvas. */
+  --code-comment: #6f7c8b;
+  --code-keyword: #b493ff;
+  --code-string: #9ed6a2;
+  --code-escape: #f0a878;
+  --code-number: #f0a878;
+  --code-function: #7fc8f8;
+  --code-type: #6fd6c0;
+  --code-variable: #dfe5ec;
+  --code-property: #cbd5e1;
+  --code-constant: #f2c76c;
+  --code-tag: #e06e72;
+  --code-attribute: #f2c76c;
+  --code-operator: #9aa7b4;
+  --code-punctuation: #8896a5;
+  --code-meta: #9aa7b4;
+  --code-heading: #87d7ff;
+  --code-link: #87d7ff;
+  --code-invalid: #ff6b70;
+  --code-bracket-1: #f2c76c;
+  --code-bracket-2: #b493ff;
+  --code-bracket-3: #6fd6c0;
+  --code-indent-guide: rgb(223 229 236 / 13%);
+  --code-indent-guide-active: rgb(106 168 235 / 55%);
+  --code-minimap-ink: rgb(223 229 236 / 42%);
+  --code-minimap-slider: rgb(223 229 236 / 9%);
+  --code-minimap-slider-strong: rgb(223 229 236 / 18%);
+
+  --side-width: 224px;
+  --side-width-collapsed: 64px;
+  --top-height: 56px;
+  --activity-width: 340px;
+  --radius: var(--radius-panel);
+}
+
+:root:is([data-theme="light"], [data-theme="zero-light"]) {
+  --code-comment: #5f6f7e;
+  --code-keyword: #7b3fd4;
+  --code-string: #1f7a4d;
+  --code-escape: #9a4d18;
+  --code-number: #9a4d18;
+  --code-function: #1a5fa8;
+  --code-type: #0f6f68;
+  --code-variable: #273544;
+  --code-property: #35475a;
+  --code-constant: #8a5a00;
+  --code-tag: #a52f3a;
+  --code-attribute: #8a5a00;
+  --code-operator: #55647a;
+  --code-punctuation: #5a6978;
+  --code-meta: #55647a;
+  --code-heading: #12508f;
+  --code-link: #1a5fa8;
+  --code-invalid: #ac4149;
+  --code-bracket-1: #8a5a00;
+  --code-bracket-2: #7b3fd4;
+  --code-bracket-3: #0f6f68;
+  --code-indent-guide: rgb(39 53 68 / 14%);
+  --code-indent-guide-active: rgb(40 105 173 / 55%);
+  --code-minimap-ink: rgb(39 53 68 / 46%);
+  --code-minimap-slider: rgb(39 53 68 / 9%);
+  --code-minimap-slider-strong: rgb(39 53 68 / 17%);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --canvas: #eef3f8;
+  --surface: #f9fbfd;
+  --surface-muted: #e9eff5;
+  --surface-raised: #ffffff;
+  --surface-hover: #e1eaf3;
+  --text: #273544;
+  --text-strong: #101923;
+  --muted: #5a6978;
+  --muted-strong: #465666;
+  --border: #becbd8;
+  --border-soft: #d5dee7;
+  --blue: #2869ad;
+  --blue-bright: #155b9f;
+  --blue-muted: rgb(40 105 173 / 11%);
+  --green: #267651;
+  --green-muted: #d9efe5;
+  --violet: #7054af;
+  --yellow: #81601b;
+  --orange: #95602e;
+  --red: #ac4149;
+  --red-muted: #f8e1e5;
+  --focus: #246db6;
+  --on-accent: #ffffff;
+  --on-danger: #ffffff;
+  --action-primary: var(--blue);
+  --action-primary-hover: color-mix(in srgb, var(--blue) 88%, #000);
+  --action-primary-pressed: color-mix(in srgb, var(--blue) 78%, #000);
+  --action-primary-text: #ffffff;
+  --shadow: 0 18px 48px rgb(41 63 84 / 16%);
+}
+
+/* The original Zero Dark preference now has its own stable palette. */
+:root[data-theme="zero-classic"] {
+  color-scheme: dark;
+  --canvas: #080a0d;
+  --surface: #0e1115;
+  --surface-muted: #12161b;
+  --surface-raised: #171c22;
+  --surface-hover: #1b222a;
+  --text: #dde5ed;
+  --text-strong: #f5f8fb;
+  --muted: #96a1ad;
+  --muted-strong: #aab6c2;
+  --border: #2a333d;
+  --border-soft: #1d252e;
+  --blue: #75aee8;
+  --blue-bright: #9ac5ef;
+  --blue-muted: rgb(117 174 232 / 12%);
+  --green: #63b991;
+  --green-muted: #112b22;
+  --violet: #aa94dc;
+  --yellow: #d5b46d;
+  --orange: #d09561;
+  --red: #db7477;
+  --red-muted: #351d21;
+  --focus: #99c9f8;
+  --on-accent: #071827;
+  --on-danger: #180405;
+  --action-primary: color-mix(in srgb, var(--blue) 56%, var(--surface-raised));
+  --action-primary-hover: color-mix(in srgb, var(--blue) 58%, var(--surface-raised));
+  --action-primary-pressed: color-mix(in srgb, var(--blue) 50%, var(--surface-raised));
+  --action-primary-text: #f4f8fc;
+  --shadow: 0 18px 48px rgb(0 0 0 / 46%);
+}
+
+:root[data-theme="glacier"] {
+  color-scheme: dark;
+  --canvas: #071923;
+  --surface: #102834;
+  --surface-muted: #16313e;
+  --surface-raised: #1c3b4a;
+  --surface-overlay: #213f4d;
+  --surface-hover: #284a59;
+  --text: #deedf1;
+  --text-strong: #f6fcfd;
+  --muted: #a8c0c9;
+  --muted-strong: #c3d7de;
+  --border: #466978;
+  --border-soft: #2c4c5a;
+  --blue: #6cc9df;
+  --blue-bright: #a4e7f0;
+  --blue-muted: rgb(108 201 223 / 15%);
+  --green: #78c5a6;
+  --green-muted: #173b32;
+  --violet: #b7b0e2;
+  --yellow: #e9ca83;
+  --orange: #dda677;
+  --red: #e3888a;
+  --red-muted: #402a34;
+  --focus: #a4e7f0;
+  --on-accent: #06202b;
+  --action-primary: #286f88;
+  --action-primary-hover: #3388a3;
+  --action-primary-pressed: #215c72;
+  --action-primary-text: #f6fcfd;
+  --brand-start: #6cc9df;
+  --brand-end: #6d9cdf;
+  --shadow: 0 18px 48px rgb(2 14 22 / 48%);
+}
+
+:root[data-theme="amber"] {
+  color-scheme: dark;
+  --canvas: #1c1511;
+  --surface: #291f19;
+  --surface-muted: #32251d;
+  --surface-raised: #392b22;
+  --surface-overlay: #413025;
+  --surface-hover: #4b3729;
+  --text: #f1e4d3;
+  --text-strong: #fff8eb;
+  --muted: #c8ae93;
+  --muted-strong: #ddc4a8;
+  --border: #70523b;
+  --border-soft: #513b2d;
+  --blue: #e7ad62;
+  --blue-bright: #ffd397;
+  --blue-muted: rgb(231 173 98 / 15%);
+  --green: #a5c892;
+  --green-muted: #303b27;
+  --violet: #d6b5d5;
+  --yellow: #eac777;
+  --orange: #efad6b;
+  --red: #eb8e88;
+  --red-muted: #4a2828;
+  --focus: #ffd397;
+  --on-accent: #2c1908;
+  --action-primary: #9c622d;
+  --action-primary-hover: #b27639;
+  --action-primary-pressed: #824f23;
+  --action-primary-text: #fff8eb;
+  --brand-start: #e7ad62;
+  --brand-end: #c9805c;
+  --shadow: 0 18px 48px rgb(20 11 5 / 54%);
+}

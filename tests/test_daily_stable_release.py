@@ -1,0 +1,595 @@
+"""Focused checks for daily release decisions before any external mutation."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+SPEC = importlib.util.spec_from_file_location(
+    "daily_stable_release",
+    Path(__file__).resolve().parents[1] / "scripts/daily_stable_release.py",
+)
+assert SPEC and SPEC.loader
+daily = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(daily)
+
+
+@pytest.mark.parametrize(
+    ("previous", "next_version"),
+    [
+        ("nebula-v3.0.0-beta.3", "3.0.0"),
+        ("nebula-v3.0.0", "3.0.1"),
+        ("nebula-v3.2.9", "3.2.10"),
+    ],
+)
+def test_next_stable_version(previous: str, next_version: str) -> None:
+    assert daily.next_stable_version(previous) == next_version
+
+
+def test_invalid_release_version_stops() -> None:
+    with pytest.raises(RuntimeError, match="Cannot derive"):
+        daily.next_stable_version("nebula-v2.9.0")
+
+
+def test_main_requires_successful_push_ci() -> None:
+    with (
+        patch.object(daily, "MAIN_SHA", "a" * 40),
+        patch.object(
+            daily,
+            "gh_json",
+            return_value={
+                "workflow_runs": [
+                    {
+                        "event": "pull_request",
+                        "conclusion": "success",
+                        "head_sha": "a" * 40,
+                    },
+                    {"event": "push", "conclusion": "failure", "head_sha": "a" * 40},
+                ]
+            },
+        ),
+        pytest.raises(RuntimeError, match="CI has not passed"),
+    ):
+        daily.green_main()
+
+
+def test_transient_github_read_error_retries_without_repeating_mutations() -> None:
+    with (
+        patch.object(
+            daily,
+            "run",
+            side_effect=[
+                RuntimeError("gh: Server Error (HTTP 502)"),
+                RuntimeError("gh: rate limit (HTTP 429)"),
+                '{"workflow_runs": []}',
+            ],
+        ) as command,
+        patch.object(daily.time, "sleep") as sleep,
+    ):
+        assert daily.gh_json("repos/example/nebula/actions/workflows/ci.yml/runs") == {
+            "workflow_runs": []
+        }
+    assert command.call_count == 3
+    assert all(call.args[0:2] == ("gh", "api") for call in command.call_args_list)
+    assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
+
+
+def test_nonretryable_github_read_error_stops_immediately() -> None:
+    with (
+        patch.object(daily, "run", side_effect=RuntimeError("gh: Forbidden (HTTP 403)")) as command,
+        patch.object(daily.time, "sleep") as sleep,
+        pytest.raises(RuntimeError, match="HTTP 403"),
+    ):
+        daily.gh_json("repos/example/nebula/releases")
+    command.assert_called_once()
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("result", ["failed", "missing", "wrong-hash"])
+def test_core_smoke_receipt_blocks_failed_or_missing_result(result):
+    def download(*args, **_kwargs):
+        directory = Path(args[args.index("--dir") + 1])
+        if result == "missing":
+            return ""
+        payload = {
+            "schema_version": 1,
+            "tag": "nebula-v3.0.0",
+            "commit": "c" * 40,
+            "case": "release core smoke pairs, creates a project, and retains one answer",
+            "selected_test_count": 1,
+            "retries": 0,
+            "installed_deb_sha256": "e" * 64 if result == "wrong-hash" else "d" * 64,
+            "result": "failed" if result == "failed" else "passed",
+        }
+        (directory / "release-core-smoke.json").write_text(json.dumps(payload))
+        return ""
+
+    with (
+        patch.object(daily, "run", side_effect=download),
+        pytest.raises(RuntimeError, match="core smoke receipt"),
+    ):
+        daily.verify_core_smoke_receipt(123, "nebula-v3.0.0", "c" * 40, "d" * 64)
+
+
+def test_core_smoke_receipt_accepts_exact_installed_artifact():
+    def download(*args, **_kwargs):
+        directory = Path(args[args.index("--dir") + 1])
+        (directory / "release-core-smoke.json").write_text(json.dumps({
+            "schema_version": 1,
+            "tag": "nebula-v3.0.0",
+            "commit": "c" * 40,
+            "case": "release core smoke pairs, creates a project, and retains one answer",
+            "selected_test_count": 1,
+            "retries": 0,
+            "installed_deb_sha256": "d" * 64,
+            "result": "passed",
+        }))
+        return ""
+
+    with patch.object(daily, "run", side_effect=download):
+        daily.verify_core_smoke_receipt(123, "nebula-v3.0.0", "c" * 40, "d" * 64)
+
+
+def test_workflow_wait_ignores_older_run() -> None:
+    started = datetime(2026, 10, 8, 13, 0, tzinfo=timezone.utc)
+    runs = {
+        "workflow_runs": [
+            {
+                "id": 1,
+                "head_branch": "nebula-v3.0.0",
+                "head_sha": "c" * 40,
+                "event": "workflow_dispatch",
+                "created_at": "2026-10-08T12:59:59Z",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 2,
+                "head_branch": "nebula-v3.0.0",
+                "head_sha": "c" * 40,
+                "event": "workflow_dispatch",
+                "created_at": "2026-10-08T13:00:00Z",
+                "status": "completed",
+                "conclusion": "success",
+            },
+        ]
+    }
+    with patch.object(daily, "gh_json", return_value=runs):
+        assert (
+            daily.wait_for_workflow(
+                "nebula3-release.yml", "nebula-v3.0.0", "c" * 40, started
+            )
+            == 2
+        )
+
+
+def test_workflow_wait_stops_on_failed_run() -> None:
+    started = datetime(2026, 10, 8, 13, 0, tzinfo=timezone.utc)
+    runs = {
+        "workflow_runs": [
+            {
+                "id": 2,
+                "head_branch": "nebula-v3.0.0",
+                "head_sha": "c" * 40,
+                "event": "workflow_dispatch",
+                "created_at": "2026-10-08T13:00:00Z",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+    }
+    with (
+        patch.object(daily, "gh_json", return_value=runs),
+        pytest.raises(RuntimeError, match="ended failure"),
+    ):
+        daily.wait_for_workflow(
+            "nebula3-release.yml", "nebula-v3.0.0", "c" * 40, started
+        )
+
+
+@pytest.fixture
+def release_driver(tmp_path, monkeypatch):
+    """Run the driver with all GitHub/tag/build mutations replaced by mocks."""
+    monkeypatch.chdir(tmp_path)
+    Path("docs/releases").mkdir(parents=True)
+    monkeypatch.setattr(daily, "REPOSITORY", "example/nebula")
+    monkeypatch.setattr(daily, "MAIN_SHA", "b" * 40)
+    monkeypatch.setenv("GH_TOKEN", "fixture-actions-token")
+    monkeypatch.setenv("NEBULA_RELEASE_APP_PRIVATE_KEY", "fixture-private-key")
+    previous = {"tag_name": "nebula-v3.0.0-beta.3"}
+    commands = []
+    state = {
+        "source": "a" * 40,
+        "ci": "success",
+        "advanced": False,
+        "app_error": None,
+    }
+    calls = []
+
+    def run(*args, **_kwargs):
+        commands.append(args)
+        calls.append((args, _kwargs))
+        if state.get("error_predicate", lambda _args: False)(args):
+            raise RuntimeError("simulated uncertain command failure")
+        if (
+            args[:3] == ("git", "ls-remote", "--tags")
+            and args[-1] == "refs/tags/nebula-v3.0.0"
+            and state.get("existing_tag")
+        ):
+            return "c" * 40
+        if (
+            args[:3] == ("gh", "release", "view")
+            and "--json" not in args
+            and args[3] == "nebula-v3.0.0"
+            and state.get("existing_release")
+        ):
+            return "existing release"
+        if args[:3] == ("git", "diff", "--name-only") and state.get("workflow_change"):
+            return ".github/workflows/nebula3-release.yml"
+        if args == ("git", "rev-parse", "HEAD"):
+            return (
+                "c" * 40
+                if any(c[:2] == ("git", "commit") for c in commands)
+                else "b" * 40
+            )
+        if args == ("git", "rev-parse", "origin/main"):
+            return "d" * 40 if state["advanced"] else "b" * 40
+        if args[:2] == ("git", "show"):
+            return f"<!-- nebula-source-sha: {state['source']} -->"
+        if args[:2] == ("git", "log"):
+            return "b123 focused change"
+        if args[:3] == ("gh", "release", "view") and "--json" in args:
+            return json.dumps(
+                {"isDraft": True, "isPrerelease": False, "tagName": args[3]}
+            )
+        return ""
+
+    def api(endpoint, **_kwargs):
+        if "ci.yml/runs" in endpoint:
+            return {
+                "workflow_runs": [
+                    {
+                        "event": "push",
+                        "head_sha": "b" * 40,
+                        "conclusion": state["ci"],
+                    }
+                ]
+            }
+        return {"sha": ("d" if state["advanced"] else "b") * 40}
+
+    @contextmanager
+    def app_token(_permission):
+        if state["app_error"]:
+            raise RuntimeError(state["app_error"])
+        yield "fixture-installation-token"
+
+    monkeypatch.setattr(daily.release_app, "installation_token", app_token)
+    monkeypatch.setattr(daily, "run", run)
+    monkeypatch.setattr(daily, "gh_json", api)
+    monkeypatch.setattr(daily, "published_release", lambda: previous)
+    with (
+        patch.object(daily, "wait_for_workflow", side_effect=[101, 102, 103]) as wait,
+        patch.object(daily, "verify_core_smoke_receipt") as receipt,
+        patch.object(daily, "verify_assets", return_value="d" * 64) as assets,
+        patch.object(
+            daily.subprocess, "run", return_value=SimpleNamespace(returncode=0)
+        ),
+    ):
+        yield SimpleNamespace(
+            commands=commands,
+            state=state,
+            wait=wait,
+            receipt=receipt,
+            assets=assets,
+            calls=calls,
+        )
+
+
+def assert_no_release_mutations(driver):
+    assert not any(
+        command[0] == "git" and "push" in command for command in driver.commands
+    )
+    assert not any(
+        command[:2]
+        in {
+            ("git", "tag"),
+            ("git", "push"),
+            ("git", "commit"),
+            ("git", "checkout"),
+        }
+        for command in driver.commands
+    )
+    assert not any(command[:2] == ("gh", "workflow") for command in driver.commands)
+    driver.wait.assert_not_called()
+    driver.receipt.assert_not_called()
+    driver.assets.assert_not_called()
+
+
+def test_no_new_source_commits_skip_without_tests_or_tags(release_driver):
+    release_driver.state["source"] = "b" * 40
+    daily.main()
+    assert_no_release_mutations(release_driver)
+
+
+@pytest.mark.parametrize("ci", ["failure", "cancelled", None])
+def test_failed_or_incomplete_ci_stops_before_tagging(release_driver, ci):
+    release_driver.state["ci"] = ci
+    with pytest.raises(RuntimeError, match="CI has not passed"):
+        daily.main()
+    assert_no_release_mutations(release_driver)
+
+
+def test_advancing_main_stops_before_tagging(release_driver):
+    release_driver.state["advanced"] = True
+    with pytest.raises(RuntimeError, match="Main advanced"):
+        daily.main()
+    assert_no_release_mutations(release_driver)
+
+
+def test_missing_publication_credential_stops_before_tagging(
+    release_driver, monkeypatch
+):
+    monkeypatch.delenv("GH_TOKEN")
+    with pytest.raises(RuntimeError, match="publication credential is required"):
+        daily.main()
+    assert_no_release_mutations(release_driver)
+
+
+@pytest.mark.parametrize(
+    "error", ["missing configuration", "wrong App", "wrong scope", "HTTP 403"]
+)
+def test_invalid_app_identity_stops_before_tagging(release_driver, error):
+    release_driver.state["app_error"] = error
+    with pytest.raises(RuntimeError, match=error):
+        daily.main()
+    assert_no_release_mutations(release_driver)
+
+
+def test_single_explicit_release_path_preserves_every_gate(release_driver):
+    daily.main()
+    commands = release_driver.commands
+    commit = next(command for command in commands if command[:2] == ("git", "commit"))
+    assert commit[-1].endswith("[skip ci]")
+    dispatches = [
+        command for command in commands if command[:3] == ("gh", "workflow", "run")
+    ]
+    assert [command[3] for command in dispatches] == [
+        "nebula3-release.yml",
+        "nebula3-release-finalize.yml",
+        "publish-updater-manifest.yml",
+    ]
+    assert all("--ref" in command for command in dispatches)
+    release_driver.wait.assert_any_call(
+        "nebula3-release.yml",
+        "nebula-v3.0.0",
+        "c" * 40,
+        release_driver.wait.call_args_list[0].args[3],
+    )
+    release_driver.receipt.assert_called_once()
+    release_driver.assets.assert_called_once()
+    privileged = [
+        args
+        for args, kwargs in release_driver.calls
+        if kwargs.get("release_permission")
+    ]
+    assert len(privileged) == 4
+    assert privileged[0][0] == "git" and "push" in privileged[0]
+    assert [
+        kwargs["release_permission"]
+        for _, kwargs in release_driver.calls
+        if kwargs.get("release_permission")
+    ] == ["contents", "actions", "actions", "actions"]
+    assert privileged[1:] == dispatches
+    assert all(
+        not kwargs.get("release_permission")
+        for args, kwargs in release_driver.calls
+        if args[:3] == ("gh", "release", "edit")
+    )
+    publication = next(
+        command for command in commands if command[:3] == ("gh", "release", "edit")
+    )
+    assert commands.index(publication) > commands.index(dispatches[1])
+    assert commands.index(publication) < commands.index(dispatches[2])
+
+
+def test_missing_publication_token_cannot_fall_back_to_app_token(monkeypatch):
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    with patch.object(daily, "run") as run:
+        with pytest.raises(RuntimeError, match="publication credential is required"):
+            daily.publish_release("nebula-v3.0.0")
+    run.assert_not_called()
+
+
+def test_workflow_checks_initiator_before_exposing_app_key():
+    workflow = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/daily-stable-release.yml"
+        ).read_text()
+    )
+    jobs = workflow["jobs"]
+    assert jobs["release"]["needs"] == "validate-admin"
+    assert jobs["release"]["environment"] == {
+        "name": "desktop-release",
+        "deployment": False,
+    }
+    guard = jobs["validate-admin"]
+    assert guard["permissions"] == {"contents": "read"}
+    step = guard["steps"][0]
+    assert step["env"] == {
+        "GH_TOKEN": "${{ github.token }}",
+        "RELEASE_ACTOR": "${{ github.actor }}",
+        "RELEASE_TRIGGERING_ACTOR": "${{ github.triggering_actor }}",
+    }
+    assert 'test "$permission" = admin' in step["run"]
+    steps = jobs["release"]["steps"]
+    checkout = next(
+        step for step in steps if step.get("uses", "").startswith("actions/checkout@")
+    )
+    driver = next(
+        step
+        for step in steps
+        if step.get("run") == "python scripts/daily_stable_release.py"
+    )
+    assert checkout["with"]["persist-credentials"] is False
+    assert "token" not in checkout["with"]
+    assert driver["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert (
+        driver["env"]["NEBULA_RELEASE_APP_PRIVATE_KEY"]
+        == "${{ secrets.NEBULA_RELEASE_APP_PRIVATE_KEY }}"
+    )
+    assert jobs["release"]["if"] == "github.ref == 'refs/heads/main'"
+    assert all(
+        "NEBULA_RELEASE_APP_PRIVATE_KEY" not in str(step)
+        for step in steps
+        if step is not driver
+    )
+    assert workflow["permissions"]["actions"] == "read"
+
+
+def test_default_children_exclude_key_and_privileged_children_get_only_lease(
+    monkeypatch,
+):
+    monkeypatch.setenv("GH_TOKEN", "fixture-actions-token")
+    monkeypatch.setenv("NEBULA_RELEASE_APP_PRIVATE_KEY", "fixture-private-key")
+
+    @contextmanager
+    def token(permission):
+        assert permission == "actions"
+        yield "fixture-installation-token"
+
+    with (
+        patch.object(daily.release_app, "installation_token", token),
+        patch.object(
+            daily.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ) as process,
+    ):
+        daily.run("gh", "attestation", "verify", "fixture.deb")
+        environment = process.call_args.kwargs["env"]
+        assert environment["GH_TOKEN"] == "fixture-actions-token"
+        assert "fixture-private-key" not in environment.values()
+        daily.run(
+            "gh", "workflow", "run", "nebula3-release.yml", release_permission="actions"
+        )
+        environment = process.call_args.kwargs["env"]
+        assert environment["GH_TOKEN"] == "fixture-installation-token"
+        assert "fixture-private-key" not in environment.values()
+        assert process.call_args.kwargs["timeout"] == 120
+
+
+@pytest.mark.parametrize("existing", ["existing_tag", "existing_release"])
+def test_reserved_version_advances_without_reusing_immutable_tag(release_driver, existing):
+    release_driver.state[existing] = True
+    daily.main()
+    assert any(command[:4] == ("git", "tag", "-a", "nebula-v3.0.1") for command in release_driver.commands)
+    release_driver.assets.assert_called_once_with(101, "3.0.1")
+
+
+def test_main_advancing_during_preparation_prevents_publication(release_driver):
+    def advance_after_preparation(run_id, *_args):
+        if run_id == 101:
+            release_driver.state["advanced"] = True
+
+    release_driver.assets.side_effect = advance_after_preparation
+    with pytest.raises(RuntimeError, match="leave this candidate unpublished"):
+        daily.main()
+    assert not any(
+        command[:3] == ("gh", "release", "edit")
+        for command in release_driver.commands
+    )
+
+
+@pytest.mark.parametrize(
+    "phase", ["push", "preparation", "finalize", "publication", "updater"]
+)
+def test_uncertain_external_failure_never_advances_to_the_next_phase(
+    release_driver, phase
+):
+    def predicate(args):
+        if phase == "push":
+            return args[0] == "git" and "push" in args
+        if phase == "publication":
+            return args[:3] == ("gh", "release", "edit")
+        target = {
+            "preparation": "nebula3-release.yml",
+            "finalize": "nebula3-release-finalize.yml",
+            "updater": "publish-updater-manifest.yml",
+        }[phase]
+        return args[:4] == ("gh", "workflow", "run", target)
+
+    release_driver.state["error_predicate"] = predicate
+    with pytest.raises(RuntimeError, match="uncertain command failure"):
+        daily.main()
+    assert predicate(release_driver.commands[-1])
+    if phase in {"push", "preparation", "finalize"}:
+        assert not any(
+            command[:3] == ("gh", "release", "edit")
+            for command in release_driver.commands
+        )
+
+
+@pytest.mark.parametrize("phase", ["preparation", "finalize", "updater"])
+def test_failed_dispatched_run_stops_the_driver(release_driver, phase):
+    stages = {"preparation": 0, "finalize": 1, "updater": 2}
+    release_driver.wait.side_effect = [101, 102][: stages[phase]] + [
+        RuntimeError("dispatched run failed")
+    ]
+    with pytest.raises(RuntimeError, match="dispatched run failed"):
+        daily.main()
+    assert release_driver.wait.call_count == stages[phase] + 1
+    if phase != "updater":
+        assert not any(
+            command[:3] == ("gh", "release", "edit")
+            for command in release_driver.commands
+        )
+
+
+def test_release_only_workflow_changes_stop_before_tag_creation(release_driver):
+    release_driver.state["workflow_change"] = True
+    with pytest.raises(RuntimeError, match="unexpectedly changes workflows"):
+        daily.main()
+    assert not any(
+        command[:2] == ("git", "tag") or (command[0] == "git" and "push" in command)
+        for command in release_driver.commands
+    )
+
+
+def test_daily_dispatch_uses_one_smoke_and_checks_exact_artifact(release_driver):
+    daily.main()
+    preparation = next(
+        command for command in release_driver.commands
+        if command[:4] == ("gh", "workflow", "run", "nebula3-release.yml")
+    )
+    assert "release_tag=nebula-v3.0.0" in preparation
+    assert not any("scope=" in arg or "selection=" in arg or "review_reason=" in arg for arg in preparation)
+    release_driver.assets.assert_called_once_with(101, "3.0.0")
+    release_driver.receipt.assert_called_once_with(
+        101, "nebula-v3.0.0", "c" * 40, "d" * 64
+    )
+
+
+@pytest.mark.parametrize("gate", ["receipt", "assets"])
+def test_failed_receipt_or_artifacts_prevent_finalization(release_driver, gate):
+    getattr(release_driver, gate).side_effect = RuntimeError("verification failed")
+    with pytest.raises(RuntimeError, match="verification failed"):
+        daily.main()
+    assert not any(
+        command[:4] == ("gh", "workflow", "run", "nebula3-release-finalize.yml")
+        for command in release_driver.commands
+    )
+    assert not any(
+        command[:3] == ("gh", "release", "edit") for command in release_driver.commands
+    )

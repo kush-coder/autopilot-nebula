@@ -1,0 +1,432 @@
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { Save, ShieldCheck, TerminalSquare } from "lucide-react";
+import type { AutomationProjectPolicy, EngagementScopePolicy, NotebookRun, ScopeToolCandidate, TypeSafeIntegration, VpnProfile, WebSearchRuntime } from "../api/types";
+import { ApiError } from "../api/client";
+import { useWorkspace } from "../state/WorkspaceContext";
+import { DiagnosticErrorNotice, logCaughtDiagnostic } from "../diagnostics";
+import { announceSettingsSaved } from "./SettingsSaveFeedback";
+import { InlineValidationNotice } from "./InlineValidationNotice";
+import { useConfirmation } from "./DialogSystem";
+import { TYPESAFE_CHANGED_EVENT } from "./TypeSafeIntegrationSettings";
+import { WEB_SEARCH_CHANGED_EVENT, runtimeHealth } from "./WebSearchRuntimeSettings";
+
+function lines(value: string): string[] {
+  return [...new Set(value.split(/[\n,]+/).map((item) => item.trim()).filter(Boolean))];
+}
+
+export function parseAllowedDomains(value: string): string[] | undefined {
+  const normalized: string[] = [];
+  for (const entry of lines(value)) {
+    let domain = entry;
+    if (entry.includes("://")) {
+      try {
+        const url = new URL(entry);
+        if ((url.protocol !== "http:" && url.protocol !== "https:")
+          || url.username || url.password || url.port
+          || (url.pathname !== "/" && url.pathname !== "")
+          || url.search || url.hash) return undefined;
+        domain = url.hostname;
+      } catch {
+        // diagnostic-expected: malformed operator input is returned as inline validation.
+        return undefined;
+      }
+    }
+    normalized.push(domain.replace(/\.$/, "").toLocaleLowerCase());
+  }
+  return [...new Set(normalized)];
+}
+
+export function parseAllowedPorts(value: string): number[] | undefined {
+  const ports = new Set<number>();
+  for (const item of lines(value)) {
+    const match = item.match(/^(\d+)\s*-\s*(\d+)$/);
+    const start = Number(match?.[1] ?? item);
+    const end = Number(match?.[2] ?? item);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end > 65_535 || start > end) return undefined;
+    for (let port = start; port <= end; port += 1) ports.add(port);
+  }
+  return [...ports].sort((left, right) => left - right);
+}
+
+function formatAllowedPorts(values: number[]): string {
+  const ports = [...new Set(values)].sort((left, right) => left - right);
+  const entries: string[] = [];
+  for (let index = 0; index < ports.length;) {
+    const start = ports[index];
+    let end = start;
+    while (index + 1 < ports.length && ports[index + 1] === end + 1) end = ports[++index];
+    entries.push(end - start >= 2 ? `${start}-${end}` : end === start ? `${start}` : `${start}, ${end}`);
+    index += 1;
+  }
+  return entries.join(", ");
+}
+
+/** The raw text of a number field; empty text is NaN rather than 0. */
+function integerField(value: string): number {
+  return value.trim() === "" ? Number.NaN : Number(value);
+}
+
+function inputDate(value?: string): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.valueOf())) return "";
+  return new Date(date.valueOf() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+}
+
+function wireDate(value: string): string | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? undefined : date.toISOString();
+}
+
+/** An untested environment key counts as usable; a failed test does not. */
+export function typesafeUsable(status: TypeSafeIntegration | undefined): boolean {
+  return Boolean(status?.available && status.lastTest?.ok !== false);
+}
+
+export function EngagementPolicySettings() {
+  const confirm = useConfirmation();
+  const { api, coreState, engagement, previewMode } = useWorkspace();
+  const [scope, setScope] = useState<EngagementScopePolicy>();
+  const [policy, setPolicy] = useState<AutomationProjectPolicy>();
+  const [allowedCidrs, setAllowedCidrs] = useState("");
+  const [allowedDomains, setAllowedDomains] = useState("");
+  const [allowedUrls, setAllowedUrls] = useState("");
+  const [allowedPorts, setAllowedPorts] = useState("");
+  const [allowAllTargets, setAllowAllTargets] = useState(false);
+  const [bypassPermissions, setBypassPermissions] = useState(false);
+  const [notBefore, setNotBefore] = useState("");
+  const [notAfter, setNotAfter] = useState("");
+  const [prohibitedActions, setProhibitedActions] = useState("");
+  const [localOnly, setLocalOnly] = useState(true);
+  const [toolSuggestions, setToolSuggestions] = useState(false);
+  const [webSearch, setWebSearch] = useState(false);
+  const [webSearchDisclosesScope, setWebSearchDisclosesScope] = useState(false);
+  const [webSearchRuntime, setWebSearchRuntime] = useState<WebSearchRuntime>();
+  const [alwaysLoadedTools, setAlwaysLoadedTools] = useState<string[]>([]);
+  const [toolCandidates, setToolCandidates] = useState<ScopeToolCandidate[]>([]);
+  const [typesafe, setTypesafe] = useState<TypeSafeIntegration>();
+  // Number fields keep the operator's raw text so a cleared field stays empty
+  // instead of snapping to 0; they are parsed with a NaN guard on save.
+  const [maxConcurrency, setMaxConcurrency] = useState("1");
+  const [approvalPolicy, setApprovalPolicy] = useState<AutomationProjectPolicy["approvalPolicy"]>("on_boundary");
+  const [executionMode, setExecutionMode] = useState<"docker" | "host">("docker");
+  const [hostAcknowledged, setHostAcknowledged] = useState(false);
+  const [networkEnabled, setNetworkEnabled] = useState(false);
+  const [vpnProfileId, setVpnProfileId] = useState("");
+  const [vpnProfiles, setVpnProfiles] = useState<VpnProfile[]>([]);
+  const [maxTimeoutMs, setMaxTimeoutMs] = useState("300000");
+  const [saving, setSaving] = useState<"scope" | "runtime">();
+  const [error, setError] = useState<unknown>();
+  const [validationError, setValidationError] = useState<string>();
+  const [conflictingNotebookRuns, setConflictingNotebookRuns] = useState<NotebookRun[]>([]);
+  const loadRevision = useRef(0);
+  const policyReady = Boolean(engagement && scope?.engagementId === engagement.id && policy?.engagementId === engagement.id);
+  // A pinned tool whose server was removed, disabled or re-probed stays listed
+  // so that saving the form never drops the choice silently.
+  const unavailablePins = alwaysLoadedTools.filter((name) => !toolCandidates.some((candidate) => candidate.name === name));
+  const pinnedSummary = `${alwaysLoadedTools.length} of ${toolCandidates.length + unavailablePins.length} tools pinned.`;
+
+  const applyScope = (next: EngagementScopePolicy) => {
+    setScope(next);
+    setAllowedCidrs(next.allowedCidrs.join("\n"));
+    setAllowedDomains(next.allowedDomains.join("\n"));
+    setAllowedUrls(next.allowedUrls.join("\n"));
+    setAllowedPorts(formatAllowedPorts(next.allowedPorts));
+    setAllowAllTargets(next.allowAllTargets);
+    setBypassPermissions(next.bypassPermissions === true);
+    setNotBefore(inputDate(next.notBefore));
+    setNotAfter(inputDate(next.notAfter));
+    setProhibitedActions(next.prohibitedActions.join("\n"));
+    setLocalOnly(next.localOnly);
+    setToolSuggestions(next.toolSuggestions);
+    setWebSearch(next.webSearch);
+    setWebSearchDisclosesScope(next.webSearchDisclosesScope);
+    setAlwaysLoadedTools(next.alwaysLoadedTools);
+    setMaxConcurrency(String(next.maxConcurrency));
+  };
+
+  const applyPolicy = (next: AutomationProjectPolicy) => {
+    setPolicy(next);
+    setExecutionMode(next.executionMode ?? "docker");
+    setHostAcknowledged(next.hostAccessAcknowledged ?? false);
+    setApprovalPolicy(next.approvalPolicy);
+    setNetworkEnabled(next.networkEnabled);
+    setVpnProfileId(next.vpnProfileId ?? "");
+    setMaxTimeoutMs(String(next.maxTimeoutMs));
+  };
+
+  const load = useCallback(async () => {
+    if (!api || coreState !== "online" || !engagement) return;
+    const revision = ++loadRevision.current;
+    setPolicy(undefined);
+    setScope(undefined);
+    setSaving(undefined);
+    setError(undefined);
+    setConflictingNotebookRuns([]);
+    try {
+      const [nextScope, nextPolicy, nextVpnProfiles] = await Promise.all([
+        api.getEngagementScope(engagement.id),
+        api.getAutomationPolicy(engagement.id),
+        api.listVpnProfiles().catch((vpnError) => {
+          if (vpnError instanceof ApiError && (vpnError.status === 404 || vpnError.status === 501)) return [];
+          void logCaughtDiagnostic("interface.engagement_policy.vpn_profiles_unavailable", "VPN profiles are unavailable in this Core build.", vpnError, "engagement_policy");
+          return Promise.reject(vpnError);
+        }),
+      ]);
+      if (revision !== loadRevision.current) return;
+      applyScope(nextScope);
+      applyPolicy(nextPolicy);
+      setVpnProfiles(nextVpnProfiles);
+      // The pinned-tool choices load on their own; a Core without the
+      // endpoint, or an MCP probe failure, must not block the policy form.
+      api.listScopeToolCandidates(engagement.id).then((next) => {
+        if (revision === loadRevision.current) setToolCandidates(next);
+      }).catch((candidateError) => {
+        if (revision === loadRevision.current) setToolCandidates([]);
+        if (candidateError instanceof ApiError && (candidateError.status === 404 || candidateError.status === 501)) return;
+        void logCaughtDiagnostic("interface.engagement_policy.tool_candidates_unavailable", "Always-loaded tool choices could not be loaded.", candidateError, "engagement_policy");
+      });
+      // Key status only gates the opt-in; its failure never blocks the policy.
+      api.getTypeSafeIntegration().then((next) => {
+        if (revision === loadRevision.current) setTypesafe(next);
+      }).catch((typesafeError) => {
+        void logCaughtDiagnostic("interface.engagement_policy.typesafe_status_unavailable", "TypeSafe key status could not be loaded.", typesafeError, "engagement_policy");
+      });
+    } catch (loadError) {
+      if (revision !== loadRevision.current) return;
+      void logCaughtDiagnostic("interface.execution_policy.caught_failure_01", "A handled interface operation failed.", loadError, "execution_policy");
+      setError(loadError instanceof Error ? loadError.message : "Could not load project execution policy.");
+    }
+  }, [api, coreState, engagement?.id]);
+
+  useEffect(() => { void load(); return () => { loadRevision.current += 1; }; }, [load]);
+
+  useEffect(() => {
+    const follow = (event: Event) => setTypesafe((event as CustomEvent<TypeSafeIntegration>).detail);
+    window.addEventListener(TYPESAFE_CHANGED_EVENT, follow);
+    return () => window.removeEventListener(TYPESAFE_CHANGED_EVENT, follow);
+  }, []);
+
+  useEffect(() => {
+    const follow = (event: Event) => setWebSearchRuntime((event as CustomEvent<WebSearchRuntime>).detail);
+    window.addEventListener(WEB_SEARCH_CHANGED_EVENT, follow);
+    return () => window.removeEventListener(WEB_SEARCH_CHANGED_EVENT, follow);
+  }, []);
+
+  useEffect(() => {
+    if (!api || coreState !== "online") return;
+    // The panel's own settings must render even when this optional read fails.
+    void (async () => {
+      try {
+        setWebSearchRuntime(await api.getWebSearchRuntime());
+      } catch (loadError) {
+        void logCaughtDiagnostic("interface.engagement_policy.web_search_status_failed", "The web search runtime status could not be read.", loadError, "engagement_policy");
+      }
+    })();
+  }, [api, coreState]);
+
+  const pinTool = (name: string, pinned: boolean) => setAlwaysLoadedTools((current) => pinned
+    ? [...new Set([...current, name])].sort()
+    : current.filter((item) => item !== name));
+
+  const saveScope = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!api || !engagement || !scope || !policyReady || saving || previewMode) return;
+    const revision = loadRevision.current;
+    const domains = parseAllowedDomains(allowedDomains);
+    if (!domains) {
+      setValidationError("Allowed domains accept a hostname or a root HTTP(S) URL such as www.example.com or https://www.example.com. Put URLs with paths or ports in URL-only scope.");
+      return;
+    }
+    const ports = parseAllowedPorts(allowedPorts);
+    if (!ports) {
+      setValidationError("Allowed ports must be numbers or ascending ranges from 0 through 65535, such as 80, 443, or 0-400.");
+      return;
+    }
+    const start = wireDate(notBefore);
+    const end = wireDate(notAfter);
+    if (start && end && start >= end) {
+      setValidationError("The scope end time must be after its start time. Change one of the dates and save again.");
+      return;
+    }
+    const concurrency = integerField(maxConcurrency);
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 256) {
+      setValidationError("Maximum concurrency must be a whole number from 1 through 256.");
+      return;
+    }
+    if (bypassPermissions && localOnly) {
+      setValidationError("Turn off Local only before enabling Allow all. This mode permits remote data transfer.");
+      return;
+    }
+    if (bypassPermissions && !scope.bypassPermissions) {
+      const approved = await confirm({
+        title: "Bypass Nebula permissions for this Project?",
+        message: <>Enabled tools will run without Nebula target, port, time-window, prohibited-action, MCP approval, or prompt checks. Remote data transfer can occur. Direct harness sessions keep their launch mode; provider turns read the current Project mode. Operating-system and Mercury controls still apply.</>,
+        confirmLabel: "Allow all",
+        tone: "danger",
+      });
+      if (!approved || revision !== loadRevision.current) return;
+    } else if (allowAllTargets && !scope.allowAllTargets) {
+      const approved = await confirm({
+        title: "Allow every network target and port?",
+        message: <>This removes destination and port boundaries for Browser actions and project-scoped networking. Time windows, prohibited actions, privacy controls, and high-risk approval requirements still apply. Existing allowlist entries are retained for when you turn this mode off.</>,
+        confirmLabel: "Allow all targets",
+        tone: "danger",
+      });
+      if (!approved || revision !== loadRevision.current) return;
+    }
+    setSaving("scope"); setError(undefined); setValidationError(undefined);
+    try {
+      const next = await api.updateEngagementScope(engagement.id, {
+        allowedCidrs: lines(allowedCidrs),
+        allowedDomains: domains,
+        allowedUrls: lines(allowedUrls),
+        allowedPorts: ports,
+        allowAllTargets,
+        bypassPermissions,
+        notBefore: start,
+        notAfter: end,
+        prohibitedActions: lines(prohibitedActions),
+        localOnly,
+        toolSuggestions,
+        webSearch,
+        // A project that never opted in cannot leave disclosure armed.
+        webSearchDisclosesScope: webSearch && webSearchDisclosesScope,
+        alwaysLoadedTools,
+        maxConcurrency: concurrency,
+        grants: scope.grants,
+        expectedRevision: scope.revision,
+      });
+      if (revision !== loadRevision.current) return;
+      applyScope(next);
+      announceSettingsSaved("Network scope updated for new sessions.");
+    } catch (saveError) {
+      if (revision !== loadRevision.current) return;
+      void logCaughtDiagnostic("interface.engagement_policy.scope_save_failed", "Project scope could not be saved.", saveError, "engagement_policy");
+      setError(saveError);
+    } finally { if (revision === loadRevision.current) setSaving(undefined); }
+  };
+
+  const saveRuntime = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!api || !engagement || !policy || !policyReady || saving || previewMode) return;
+    const revision = loadRevision.current;
+    const timeoutMs = integerField(maxTimeoutMs);
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 86_400_000) {
+      setValidationError("Maximum command timeout must be a whole number from 1000 through 86400000 milliseconds.");
+      return;
+    }
+    if (executionMode === "host" && !hostAcknowledged) { setValidationError("Acknowledge host access before enabling Host mode."); return; }
+    setSaving("runtime"); setError(undefined); setValidationError(undefined); setConflictingNotebookRuns([]);
+    try {
+      const next = await api.updateAutomationPolicy(engagement.id, {
+        executionMode,
+        hostAccessAcknowledged: hostAcknowledged,
+        approvalPolicy,
+        networkEnabled,
+        runnerProfileId: policy.runnerProfileId,
+        vpnProfileId: vpnProfileId || undefined,
+        maxTimeoutMs: timeoutMs,
+        expectedRevision: policy.revision,
+      });
+      if (revision !== loadRevision.current) return;
+      applyPolicy(next);
+      announceSettingsSaved("Runtime policy updated for new sessions.");
+    } catch (saveError) {
+      if (revision !== loadRevision.current) return;
+      void logCaughtDiagnostic("interface.engagement_policy.runtime_save_failed", "Project command-runtime policy could not be saved.", saveError, "engagement_policy");
+      setError(saveError);
+      if (saveError instanceof ApiError && saveError.status === 409) {
+        try {
+          const active = await api.listActiveNotebookRuns(engagement.id);
+          if (revision === loadRevision.current) setConflictingNotebookRuns(active);
+        } catch (readError) {
+          void logCaughtDiagnostic("interface.engagement_policy.notebook_runs_unavailable", "Running notebook cells could not be listed after a policy conflict.", readError, "engagement_policy");
+        }
+      }
+    } finally { if (revision === loadRevision.current) setSaving(undefined); }
+  };
+
+  const interruptConflictingRuns = async () => {
+    if (!api || !engagement || !conflictingNotebookRuns.length || saving) return;
+    const revision = loadRevision.current;
+    setSaving("runtime");
+    setError(undefined);
+    try {
+      await Promise.all(conflictingNotebookRuns.map(async run => {
+        await api.interruptNotebookRun(engagement.id, run.id);
+        const settled = await api.waitNotebookRun(engagement.id, run.id);
+        if (settled.run.status === "queued" || settled.run.status === "running") {
+          throw new Error("A notebook cell is still stopping. Retry the interrupt before saving the mode change.");
+        }
+      }));
+      if (revision !== loadRevision.current) return;
+      setConflictingNotebookRuns([]);
+      setValidationError("Notebook cells interrupted. Save the runtime policy again.");
+    } catch (interruptError) {
+      if (revision !== loadRevision.current) return;
+      void logCaughtDiagnostic("interface.engagement_policy.notebook_interrupt_failed", "A notebook cell could not be interrupted.", interruptError, "engagement_policy");
+      setError(interruptError);
+    } finally { if (revision === loadRevision.current) setSaving(undefined); }
+  };
+
+  return <section className="settings-section" id="engagement-policy-settings" data-guide="project-policy">
+    <div className="section-heading"><div><h2>Project execution policy</h2><p>Freeze the scope, approval behavior, and whole-project network boundary used by new agent sessions.</p></div><ShieldCheck size={20} /></div>
+    {Boolean(error) && <DiagnosticErrorNotice error={error} fallback="The project policy could not be updated." compact />}
+    {conflictingNotebookRuns.length > 0 && <button className="button secondary" type="button" disabled={Boolean(saving)} onClick={() => void interruptConflictingRuns()}>Interrupt {conflictingNotebookRuns.length === 1 ? "notebook cell" : `${conflictingNotebookRuns.length} notebook cells`}</button>}
+    {!policyReady && (error ? <button className="button secondary" type="button" onClick={() => void load()}>Retry loading project policy</button> : <p role="status">Loading project policy…</p>)}
+    {validationError && <InlineValidationNotice message={validationError} />}
+    <div className="runner-layout policy-layout">
+      <form className="panel policy-form" onSubmit={(event) => void saveRuntime(event)}>
+        <header className="panel-header compact"><div><h3>Command runtime</h3><p>Workspace commands never need a target address.</p></div><TerminalSquare size={18} /></header>
+        <fieldset className="policy-form-body" aria-label="Command runtime settings" disabled={!policyReady || Boolean(saving) || previewMode}>
+          <label>Execution mode<select aria-label="Project execution mode" disabled={!policy || saving === "runtime"} value={executionMode} onChange={(event) => setExecutionMode(event.target.value as "docker" | "host")}><option value="docker">Docker mode</option><option value="host">Host mode</option></select><small>{executionMode === "docker" ? "Commands run inside Docker with the project folder mounted at /workspace." : "Commands run directly on the Nebula server as its OS user, starting in the project folder."}</small></label>
+          {executionMode === "host" && <label className="provider-consent"><input type="checkbox" checked={hostAcknowledged} onChange={(event) => setHostAcknowledged(event.target.checked)} /><span><strong>Allow host filesystem and network access</strong><small>Agents can access and modify other host folders and mounted devices permitted by the server's OS account. Docker isolation, scope-filtered networking and container VPN routing do not apply. Command approvals and timeouts still apply. External MCP services keep their configured location.</small></span></label>}
+          {executionMode === "host" && <label className="provider-consent"><input type="checkbox" checked={networkEnabled} onChange={(event) => setNetworkEnabled(event.target.checked)} /><span><strong>Allow notebook package downloads</strong><small>Search PyPI and install packages into this project's managed Python environment. Host notebook code follows the server's OS network permissions.</small></span></label>}
+          <label>Approval policy<select aria-describedby="command-approval-scope" value={approvalPolicy} onChange={(event) => setApprovalPolicy(event.target.value as AutomationProjectPolicy["approvalPolicy"])}><option value="on_boundary">On boundary · prompt once for project networking</option><option value="always">Always · prompt before every command</option><option value="never">Never · no tool prompts</option></select></label>
+          <p id="command-approval-scope" className="provider-dialog-note">Applies to provider and harness tool approvals for new sessions, including native, MCP and SSH tools. Scope and explicit deny rules still apply.</p>
+          {approvalPolicy === "never" && <InlineValidationNotice message="Provider and harness tools run without approval prompts; scope and deny rules still apply." />}
+          <label>Maximum command timeout (milliseconds)<input type="number" min={1000} max={86400000} value={maxTimeoutMs} onChange={(event) => setMaxTimeoutMs(event.target.value)} /></label>
+          {executionMode === "docker" && <><label className="provider-consent"><input type="checkbox" checked={networkEnabled} onChange={(event) => setNetworkEnabled(event.target.checked)} /><span><strong>Make project-scoped networking available</strong><small>The session receives the complete validated CIDR/domain/port policy. An approval never expands that scope.</small></span></label>
+          <label>VPN route<select value={vpnProfileId} disabled={!networkEnabled} onChange={(event) => setVpnProfileId(event.target.value)}><option value="">Direct, scope-filtered egress</option>{vpnProfiles.map((profile) => <option key={profile.id} value={profile.id} disabled={!profile.available}>{profile.name} · {profile.protocol.toUpperCase()} {profile.remoteHost}</option>)}</select><small>{vpnProfileId ? "New command sessions must establish this tunnel before network access is released." : "Select a saved profile to route authorized container traffic through OpenVPN."}</small></label></>}
+          <footer><span>Existing sessions keep their frozen policy revision.</span><button className="button primary" type="submit" disabled={previewMode || !policy || saving === "runtime" || (executionMode === "host" && !hostAcknowledged)}><Save size={14} /> {saving === "runtime" ? "Saving…" : "Save runtime policy"}</button></footer>
+        </fieldset>
+      </form>
+      <form className="panel policy-form" onSubmit={(event) => void saveScope(event)}>
+        <header className="panel-header compact"><div><h3>Network scope</h3><p>DNS plus TCP egress only; URL paths alone cannot authorize shell networking.</p></div><ShieldCheck size={18} /></header>
+        <fieldset className="policy-form-body" aria-label="Network scope settings" disabled={!policyReady || Boolean(saving) || previewMode}>
+          <div role="radiogroup" aria-label="Project authorization mode">
+            <label className="provider-consent"><input type="radio" name="project-authorization-mode" checked={!allowAllTargets && !bypassPermissions} onChange={() => { setAllowAllTargets(false); setBypassPermissions(false); }} /><span><strong>Bounded</strong><small>Use the saved destinations, time window, denies, and approvals.</small></span></label>
+            <label className="provider-consent"><input type="radio" name="project-authorization-mode" checked={allowAllTargets && !bypassPermissions} onChange={() => { setAllowAllTargets(true); setBypassPermissions(false); }} /><span><strong>All destinations</strong><small>Override destination and port lists; other Nebula permissions remain.</small></span></label>
+            <label className="provider-consent"><input type="radio" name="project-authorization-mode" checked={bypassPermissions} onChange={() => { setAllowAllTargets(true); setBypassPermissions(true); }} /><span><strong>Allow all</strong><small>Bypass Nebula permission checks for enabled tools. Operating-system and Mercury controls remain.</small></span></label>
+          </div>
+          {allowAllTargets && <InlineValidationNotice message="Saved destination and port entries return when Bounded mode is selected." />}
+          <label>Allowed domains<textarea rows={4} value={allowedDomains} placeholder="example.com\nhttps://www.example.org" disabled={allowAllTargets} onChange={(event) => setAllowedDomains(event.target.value)} /><small>Hostnames and root HTTP(S) URLs are equivalent here. Paths belong in URL-only scope.</small></label>
+          <label>Allowed CIDRs<textarea rows={4} value={allowedCidrs} placeholder="203.0.113.0/24" disabled={allowAllTargets} onChange={(event) => setAllowedCidrs(event.target.value)} /></label>
+          <label>Allowed TCP ports<input value={allowedPorts} placeholder="80, 443, 8000-8100" disabled={allowAllTargets} onChange={(event) => setAllowedPorts(event.target.value)} /></label>
+          <label>URL-only scope entries<textarea rows={3} value={allowedUrls} placeholder="https://example.com/reviewed/path" disabled={allowAllTargets} onChange={(event) => setAllowedUrls(event.target.value)} /></label>
+          <div className="resource-form-grid"><label>Active from<input type="datetime-local" value={notBefore} onChange={(event) => setNotBefore(event.target.value)} /></label><label>Expires<input type="datetime-local" value={notAfter} onChange={(event) => setNotAfter(event.target.value)} /></label></div>
+          <label>Prohibited actions<textarea rows={3} value={prohibitedActions} onChange={(event) => setProhibitedActions(event.target.value)} /></label>
+          <div className="resource-form-grid"><label>Maximum concurrency<input type="number" min={1} max={256} value={maxConcurrency} onChange={(event) => setMaxConcurrency(event.target.value)} /></label><label className="provider-consent"><input type="checkbox" checked={localOnly} onChange={(event) => setLocalOnly(event.target.checked)} /><span><strong>Local only</strong><small>Do not send project data to remote models.</small></span></label></div>
+          <label className="provider-consent" id="tool-suggestions-option"><input type="checkbox" aria-describedby="tool-suggestions-detail" checked={toolSuggestions && !localOnly} disabled={localOnly || (!toolSuggestions && !typesafeUsable(typesafe))} onChange={(event) => setToolSuggestions(event.target.checked)} /><span><strong>Suggest tools with TypeSafe Jev</strong><small id="tool-suggestions-detail">{localOnly ? "Unavailable while Local only is on." : "Before each turn, send redacted operator messages, the instructions of any skill selected for the turn, and MCP tool names to TypeSafe. The model then loads only the tools it needs. Tool output is never sent."}</small></span></label>
+          {!localOnly && !typesafeUsable(typesafe) && <a className="tool-suggestions-key-link" href="#typesafe-integration-settings">Add a key in Settings › Integrations →</a>}
+          {toolSuggestions && !localOnly && typesafe && !typesafeUsable(typesafe) && <InlineValidationNotice message="Tool suggestions are on, but no working TypeSafe key is available. Turns run without suggestions until a key works." />}
+          <label className="provider-consent" id="web-search-option"><input type="checkbox" aria-describedby="web-search-detail" checked={webSearch && !localOnly} disabled={localOnly} onChange={(event) => setWebSearch(event.target.checked)} /><span><strong>Web search</strong><small id="web-search-detail">{localOnly ? "Unavailable while Local only is on: every search query leaves this machine." : "Let the assistant research the public web through the metasearch runtime on this host. It cannot reach a target, and it cannot open the pages it finds."}</small></span></label>
+          {webSearch && !localOnly && <label className="provider-consent nested-consent" id="web-search-disclosure-option"><input type="checkbox" aria-describedby="web-search-disclosure-detail" checked={webSearchDisclosesScope} onChange={(event) => setWebSearchDisclosesScope(event.target.checked)} /><span><strong>Allow queries naming in-scope targets</strong><small id="web-search-disclosure-detail">{webSearchDisclosesScope ? "A query may name this project's hosts, addresses and ranges. Upstream engines will see them." : "Off: a query naming an in-scope host or address is refused before it leaves this machine."}</small></span></label>}
+          {webSearch && !localOnly && webSearchRuntime && runtimeHealth(webSearchRuntime).tone !== "good" && <InlineValidationNotice message={`Web search is on, but the search runtime is not ready (${runtimeHealth(webSearchRuntime).label.toLowerCase()}). Turns run without it until it starts.`} />}
+          {webSearch && !localOnly && webSearchRuntime && !webSearchRuntime.imageDigest && <a className="tool-suggestions-key-link" href="#web-search-runtime-settings">Install the search runtime in Settings › Integrations →</a>}
+          <fieldset className="resource-checklist always-loaded-tools" aria-describedby="always-loaded-tools-detail">
+            <legend>Always loaded tools</legend>
+            {toolCandidates.map((candidate) => <label key={candidate.name}><input type="checkbox" checked={alwaysLoadedTools.includes(candidate.name)} onChange={(event) => pinTool(candidate.name, event.target.checked)} /><span><strong>{candidate.toolName}</strong><small>{candidate.serverName}{candidate.description ? ` \u00b7 ${candidate.description}` : ""}</small></span></label>)}
+            {unavailablePins.map((name) => <label key={name}><input type="checkbox" checked onChange={(event) => pinTool(name, event.target.checked)} /><span><strong>{name}</strong><small>Kept from an earlier choice; no enabled, probed MCP server offers it now.</small></span></label>)}
+            {!toolCandidates.length && !unavailablePins.length && <p>No connected-source tools yet. Add an MCP server and probe it to choose tools.</p>}
+          </fieldset>
+          <p id="always-loaded-tools-detail" className="provider-dialog-note">{pinnedSummary} Pinned tools stay in the model's function list for every request; other tools from connected sources are searched and loaded on demand.</p>
+          {!toolCandidates.length && !unavailablePins.length && <a className="tool-suggestions-key-link" href="#mcp-settings">Add an MCP server in Settings › MCP servers →</a>}
+          <footer><span>Private and link-local destinations require an explicit CIDR.</span><button className="button primary" type="submit" disabled={previewMode || !scope || saving === "scope"}><Save size={14} /> {saving === "scope" ? "Saving…" : "Save scope"}</button></footer>
+        </fieldset>
+      </form>
+    </div>
+  </section>;
+}

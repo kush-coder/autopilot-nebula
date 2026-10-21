@@ -1,0 +1,635 @@
+# Nebula 3
+
+Nebula 3 is the native, local-first desktop workbench and the only supported
+Nebula application.
+
+Structured Error-by-default logging, correlation IDs, the Diagnostics viewer,
+and redacted support bundles are documented in the
+[Nebula 3 local diagnostics guide](NEBULA3_DIAGNOSTICS.md).
+
+## What is available
+
+- UI-independent Pydantic domain contracts and SQLAlchemy storage.
+- SQLite WAL locally and a PostgreSQL-compatible storage URL.
+- Append-only, monotonically sequenced run events with authenticated replay.
+- SHA-256 content-addressed artifacts and immutable execution evidence.
+- Read-only Nebula 2.x data import with source manifests and rollback.
+- Versioned REST/OpenAPI resources and authenticated WebSockets.
+- Provider-neutral OpenAI Responses, Anthropic, Gemini, Bedrock, and
+  OpenAI-compatible adapters.
+- Explicit catalog profiles for commercial gateways and local runtimes,
+  including Ollama, **vLLM**, llama.cpp, SGLang, LM Studio, Hugging Face
+  endpoints, and NVIDIA NIM.
+- LangGraph supervisor/specialist missions with durable investigative tool
+  turns, approval pauses, independent evidence verification, exception retries,
+  explicit blocked outcomes, and hard budgets.
+- Typed tool plugins, strict JSON schemas, engagement-owned workspaces,
+  broker-owned DNS resolution, scope enforcement, and rootless OCI execution.
+- MCP server profiles (stdio and streamable HTTP) with explicit trust, probing,
+  and per-tool approvals, importable from Claude Desktop, Cursor, and VS Code
+  JSON files. See [MCP server configuration files](MCP-SERVERS.md).
+- React/TypeScript workspace and Tauri shell with a loopback-only sidecar token
+  handshake.
+- A human-operated Kali terminal plus reviewed assistant code execution. The
+  human terminal has an explicit root/writable/unrestricted boundary. Reviewed
+  code runs in a fresh non-root container with unrestricted outbound networking
+  after exact-source review; agent commands follow the selected Project execution
+  mode and approval policy.
+- Deterministic server-rendered PDF reports, operator-triggered AI execution
+  notes, review-first AI report drafting and note transforms, and
+  integrity-manifested engagement bundle v3 export.
+
+## Run from a source checkout
+
+Nebula is packaged as one application and required imports fail immediately if
+the installation is incomplete.
+
+```bash
+poetry install --with dev
+poetry run playwright install chromium
+poetry run nebula-core doctor
+poetry run nebula-core migrate
+poetry run nebula-core serve --host 127.0.0.1 --port 8765
+```
+
+For changes, collect and run only the affected test files or exact cases as
+described in the [focused test policy](TEST_SELECTION.md). A full backend suite
+requires a fresh, explicit approval.
+
+The server prints a generated bearer token. Remote binding requires an explicit
+`--allow-remote` acknowledgement and should be placed behind a properly
+authenticated deployment boundary. Local mode never exposes a runner socket.
+Keep the Core port distinct from local model runtimes; vLLM commonly listens on
+8000 or 8001. When developing the Vite workspace against another Core port, set
+`NEBULA_DEV_BACKEND=http://127.0.0.1:PORT` before `npm --prefix ui run dev`.
+
+Build and launch the browser workspace:
+
+```bash
+npm --prefix ui ci
+npm --prefix ui run build
+poetry run nebula-core ui
+```
+
+`nebula-core ui` is the recommended source-checkout launch path. It chooses an
+available loopback port, starts Core, serves the built workspace, and transfers
+the generated bearer token through the URL fragment. Running Vite alone starts
+only the frontend and leaves durable and command-runtime controls offline.
+
+Native-install users launch the desktop with `nebula`; `nebula-core` is reserved
+for diagnostics, migrations, headless serving, imports, exports, and other
+administration.
+
+The browser token is carried in the URL fragment, consumed into memory, and
+removed immediately. Tauri sends its 256-bit one-time token through the Core
+process's stdin instead of a URL or process argument.
+
+## Desktop installers
+
+End users install one native application; they do not install Python, Poetry,
+Node, npm, Rust, Cargo, or a compiler. The Tauri bundle contains the browser
+workspace and a sibling `nebula-core` one-file executable with Python 3.12,
+migrations, notices, and all mandatory Core dependencies. Package audits reject
+GUI bindings and in-process model stacks from this build.
+
+Release tags use `nebula-v<semantic-version>`, for example
+`nebula-v3.0.0-alpha.1`. The protected release workflow builds Linux x64
+DEB/AppImage artifacts, audits their contents,
+exercises the installed `--self-test`, creates SBOMs and provenance, and stages
+a draft release with the checked-in notes for that exact version. See
+[the release runbook](../packaging/RELEASING.md).
+
+## vLLM
+
+vLLM is a first-class local provider flavor using its OpenAI-compatible server.
+The default profile endpoint is `http://127.0.0.1:8000/v1`, but endpoint and
+model identifiers are discovered/configured at runtime and are not compiled
+into the GUI.
+
+Example provider profile:
+
+```json
+{
+  "name": "Local vLLM",
+  "provider_type": "vllm",
+  "endpoint": "http://127.0.0.1:8000/v1",
+  "enabled": true,
+  "is_local": true,
+  "capabilities": {
+    "streaming": true,
+    "cancellation": true,
+    "tool_calling": false,
+    "strict_structured_output": false,
+    "parallel_tool_calls": false,
+    "vision": false,
+    "documents": false,
+    "audio": false,
+    "embeddings": false,
+    "reasoning_controls": false
+  },
+  "privacy": {"local_only": true}
+}
+```
+
+Enable tool calling only after the served model/template passes Nebula's strict
+tool contract. A model without reliable structured calls remains analysis-only;
+Nebula never extracts executable commands from prose.
+
+The Settings workspace discovers provider types from Core. Choose **Add
+provider → vLLM**, keep or edit the loopback endpoint, optionally set the served
+model ID, then use the health button to call `/v1/models` and display the models
+reported by that runtime.
+
+An explicit vLLM profile can also back a durable CLI mission:
+
+```bash
+poetry run nebula-core run ENGAGEMENT_ID "Review the bounded scope" \
+  --provider PROVIDER_PROFILE_ID \
+  --model SERVED_MODEL_ID \
+  --max-tool-calls 0
+```
+
+Model-backed specialists receive no executable tools in this path. The run
+ledger records the provider, model, request provenance, token usage, and the
+analysis result; tool execution remains exclusively behind the policy broker.
+
+## Transient provider failures
+
+Providers answer some requests with a temporary refusal: OpenRouter's
+`HTTP 503 ... (upstream: service overloaded, please try again later)`, a gateway
+`502`/`504`, or a rate-limited `429`. Those statuses mean the upstream produced
+no output, so Nebula resends the identical request instead of failing the turn.
+Retries are bounded (3 attempts by default) and wait with exponential backoff
+plus jitter, never longer than the upstream's `Retry-After` or 20 seconds. A
+streaming turn is retried only before its first token; once any text, reasoning,
+or tool call has been delivered the partial answer is never replayed. Request
+defects -- an unknown model, a rejected key, an oversized context -- are reported
+immediately, and an exhausted retry names the attempts (`... after 3 attempts`)
+so the operator knows a manual retry adds nothing. Each retry is recorded in
+`providers.log` as `providers.request.retried`.
+
+Tune this per provider profile with the `retry_attempts` and
+`retry_backoff_seconds` options, or per deployment with
+`NEBULA_PROVIDER_RETRY_ATTEMPTS` and `NEBULA_PROVIDER_RETRY_BACKOFF_SECONDS`.
+A single attempt disables automatic retries.
+
+Native Anthropic, OpenAI Responses, Gemini and Bedrock profiles, and
+non-streamed requests to OpenAI-compatible profiles (OpenRouter, local runtimes,
+gateways: chat routing steps, mission specialists, compaction, naming), receive
+each answer as one response, so their read timeout bounds the whole generation:
+600 seconds by default, with 10 seconds to open the connection. Tune it per
+provider profile with the `request_timeout_seconds` option (up to 3600), or per
+deployment with `NEBULA_PROVIDER_REQUEST_TIMEOUT_SECONDS`. Streamed requests
+keep their 120-second limit between chunks. A timed-out generation
+counts as one of the retry attempts above, so a timeout shorter than a thinking
+model's answer pays for that answer again on every attempt. Bedrock throttling
+and service-unavailable errors are retried like the HTTP statuses above.
+
+Short utility requests -- the capability probe, conversation naming, retrieval
+planning, context compaction and scope import -- ask the model to skip
+reasoning where the route takes that control, and a route whose model must
+reason is asked once more with its default instead of failing the call. The
+capability probe allows 2,048 output tokens (less when the model's output limit
+or served window is smaller), so a model that thinks anyway still has room for
+its one call.
+
+The operator's Effort level, a subagent's level and that request to skip
+reasoning reach each provider family in its own shape: OpenRouter's `reasoning`
+object (never `none` for a model its catalog marks as always reasoning),
+OpenAI's `reasoning_effort` and the Responses `reasoning.effort` with summaries,
+DeepSeek's and Z.ai's `thinking` switch (Z.ai keeping earlier steps' reasoning)
+with `reasoning_effort` on DeepSeek and GLM-5.2+, the `chat_template_kwargs`
+thinking switch on vLLM and SGLang and `reasoning_effort` on Ollama for GLM 4.5+,
+DeepSeek V3.1+ and Qwen3, Claude's `output_config.effort` with adaptive or
+disabled thinking on Anthropic and Bedrock (Fable and Mythos always think, so
+they get the lowest effort instead), and Gemini's `thinkingLevel` or
+`thinkingBudget`. A route with no such control keeps the model's default.
+
+## Import and export
+
+```bash
+nebula-core import-2x /path/to/legacy-engagement
+nebula-core export ENGAGEMENT_ID engagement.nebula.zip
+```
+
+See [Migrating from Nebula 2](MIGRATING-2-TO-3.md) before importing production
+engagement data.
+
+Import records before/after checksums and does not write to the source folder.
+An external Chroma directory is skipped unless the operator supplies
+`--allow-external-knowledge` explicitly.
+
+The report workspace can draft an executive summary from selected findings and
+notes, or transform a linked note into an editable report-local section. AI
+output records provider, model, prompt, source hash, and operator instruction;
+it is not persisted until the operator applies and saves it. Cloud transforms
+require an eligible provider profile and per-request confirmation. PDF export
+always renders the saved report revision.
+The separate **Export engagement bundle (.nebula.zip)** action produces bundle
+format v3 with entity records, run and operation events, execution streams,
+human-terminal audit records and any selected-tool transcripts, generated drafts, report
+snapshots/PDFs, and their content-addressed artifacts. Bundles may contain
+unredacted evidence, raw execution output, and recorded security-tool terminal
+results. Treat them
+as sensitive data. They are not described as backups because Nebula 3 does not
+yet provide a restore path. Scratch workspace files are excluded unless an
+operator promoted them to an artifact.
+
+## Project knowledge and the global Library
+
+Project document uploads are extracted locally and split into bounded, overlapping
+chunks. The original artifact remains authoritative; Core stores only a rebuildable
+semantic index in ChromaDB under `<data-dir>/knowledge-index` (override with
+`NEBULA_V3_KNOWLEDGE_INDEX_DIR`). Existing inline chunk indexes are migrated when
+Core starts, and an individual source can always be rebuilt from its immutable
+artifact with the reindex action.
+
+The top-level **Library** is the reusable workspace-wide counterpart to Project
+sources. Documents and scripts added there are stored as immutable,
+content-addressed artifacts owned by the local workspace and indexed in the
+separate `nebula-library-v1` Chroma collection. They remain available when the
+operator switches Projects. Script formats are decoded and chunked as untrusted
+text; Nebula never executes a Library upload. Removing an item removes it from
+retrieval but retains its immutable repository artifact.
+
+Public URL sources are fetched once and HTML pages are rendered with Playwright
+before indexing. Browser requests are intercepted and fetched through Core's
+public-IP-pinned network boundary; private addresses, unsafe redirects, downloads,
+service workers, WebSockets, images, media, and fonts are blocked. Core stores a
+passive visible-text HTML snapshot rather than executable page markup. Non-HTML
+document URLs retain their original bounded bytes. Rendering uses Playwright's
+installed Chromium or a system Chrome/Chromium browser. Native Linux installers
+carry the Playwright-version-matched Chromium headless shell as an audited
+application resource, so URL ingestion does not require a separate browser
+installation.
+
+Chroma's local `all-MiniLM-L6-v2` ONNX embedding model is used by default. The first
+index or query downloads and caches approximately 80 MiB; subsequent embedding and
+retrieval stay local. Before that first download, the Knowledge page explains the
+one-time local setup. While it runs, the page reports downloaded bytes, total size,
+percentage, verification/preparation, and an actionable retry state if preparation
+fails. Core does not trigger this download during startup, so progress is always
+observable from the operator workspace. Chat asks the selected model for up to
+four bounded search queries, worded the way a document that answers would put it
+and leaving out what the message asks of the reply (such as "one sentence"),
+retrieves vector candidates from the active Project
+and the global Library, adds a small exact-term reranking bonus for security
+identifiers, and attaches no more than eight cited chunks within the knowledge
+token budget to the operator's message in the model request, as labeled untrusted
+data rather than instructions (the saved transcript keeps only the operator's
+words). Library citations are labeled `Library:` so their workspace-wide
+scope stays visible. Cloud-provider privacy gates, per-request confirmation, and
+secret redaction still apply after retrieval.
+
+Nearest-neighbour search always returns something, so retrieved chunks pass a local
+relevance check before they are attached. A small cross-encoder
+(`mixedbread-ai/mxbai-rerank-xsmall-v1`, quantised ONNX, about 96 MB, Apache-2.0)
+scores the best eight candidates against the operator's question and every search
+the planner proposed. Because one answering sentence is easily lost in a long chunk,
+up to sixteen sentence-sized windows of the candidates, those sharing words with the
+question or a search, are scored too, and a chunk keeps its best window's score. The
+check leans toward keeping the answer: the best-scoring chunk is attached unless the
+model confidently rejects it, together with any chunk scoring nearly as well, and
+further chunks must clear a stricter line. A question about Nebula itself, or "thanks", no longer
+carries the project's runbooks, and a message with no subject of its own ("ok,
+continue") skips knowledge planning and retrieval entirely. The model runs through
+onnxruntime on the Core host, so project text never leaves it for scoring. It is
+fetched in the background the first time a source is indexed, pinned to one
+repository commit and verified by SHA-256 before it is loaded, and stored under
+`<data-dir>/knowledge-models` (override with `NEBULA_V3_KNOWLEDGE_MODELS_DIR`);
+`GET /api/v1/knowledge/index-status` reports its state under `reranker`. Until it is
+ready, or when `NEBULA_V3_KNOWLEDGE_RERANKER=off`, retrieval attaches the nearest
+chunks as before. On the labelled calibration set in
+`tests/v3/fixtures/knowledge_relevance_calibration.json`, every question sharing
+words with its answer and every paraphrase kept its document, and every unrelated
+question attached nothing (with the lines chosen on the other questions in turn, 14
+of 15 paraphrases).
+
+Tool-enabled provider turns in a Project with ready knowledge are also offered
+`knowledge.search`, the same search a managed harness has through its gateway: when
+the attached reference material does not answer, the model can search the Project's
+documents and Library itself. It is offered whenever knowledge is enabled for the
+turn and may reach its model (a local model, or a cloud model with sensitive-data
+permission and the knowledge confirmation), not per message, so the tool list stays
+stable for prompt caching. A search the model asked for is ranked by the relevance
+model and each excerpt is labelled strong, possible or weak rather than filtered, so
+the model judges a loose match itself; the harness gateway's search does the same.
+Excerpts a search returned join the answer's citations, provider and harness turns
+alike, except a weak one the answer does not refer to by chunk id. A cloud model's
+searches exclude local-only sources and redact secrets, results carry source and
+chunk ids for citation, and the search is a read that needs no approval.
+
+## Context compaction
+
+For the distinction between durable conversation history, what each provider
+call receives, conversation snapshots, and same-turn tool checkpoints, see the
+[conversation and context lifecycle guide](CHAT_CONTEXT_LIFECYCLE.md) and its
+[state machines](design/assistant-context-state-machine.md).
+
+Analyst chats and model-facing mission dependency context are compacted
+automatically when the estimated input approaches 75 percent of the configured
+model capacity. Provider profiles may declare `context_window` and
+`max_output_tokens` in their options; Core conservatively assumes an 8,192-token
+window and a 2,048-token output allowance when no limits are configured.
+
+Once the window is known (from the model catalog, verified OpenRouter routes,
+Nebula's known model limits or the profile), a reply may use up to a quarter
+of it by default: at least 8,192 tokens, but never more than half the window.
+A published output limit below that share is the default instead. The rest of
+the window is the input capacity that compaction works against. A published
+limit at or above the window, or no published limit, is not a separate limit,
+so the share applies. So it does to the roughly 90%-of-window figure many
+OpenRouter endpoints publish when they have no separate limit. As the default,
+that figure left a tenth of the window for input and compaction ran after a
+few turns. For example, `deepseek/deepseek-v4.1-flash` on a 163,840-token route
+that publishes 65,536 now defaults to 40,960 output tokens, which leaves 122,880
+for input. A published limit still caps a request that asks for more. The
+profile's `max_output_tokens` is the operator's own figure. It sizes every
+reply, held only to the window and to a limit the model publishes, and is
+never cut to the share.
+
+Reasoning models spend their thinking from the same allowance on most routes.
+OpenRouter derives an effort's reasoning budget from it, and Claude models
+before 4.6 get a thinking budget that is a share of it. When a turn still ends
+at the limit, or with thoughts but no answer, Nebula asks once more for the
+answer alone with twice the room (at least 4,096 tokens), up to the model's
+published limit and what the window leaves. An explicit maximum on the
+profile or the request is kept for that retry. The capability probe keeps its
+own 2,048-token allowance. To give a thinking model, or a reply longer than
+the default, more room on every turn, set the profile's maximum output.
+
+Compaction uses the conversation or mission's selected provider and model, so it
+can add model latency, token usage, and cost. Workbench and Activity show the
+latest compaction status and usage. Compaction fails closed:
+Nebula returns a retryable error instead of silently dropping older context when
+a required summary cannot be validated.
+
+Authenticated operators can inspect the same read-only status through
+`GET /api/v1/chat/sessions/{session_id}/context` and
+`GET /api/v1/runs/{run_id}/context`. These responses expose resolved limits,
+active-context estimates, compaction usage and cost, coverage, and canonical
+source references; they do not provide snapshot mutation routes.
+
+Every original chat message, mission result, event, evidence record, and
+LangGraph checkpoint remains unchanged. Derived working-memory snapshots cite
+their canonical message sequences or task/result identifiers, are included in
+engagement exports, and are never treated as evidence. Memory is isolated to a
+single chat session or mission run; it is not shared across an engagement.
+
+## Built-in operator help
+
+Analyst chat deterministically retrieves a small number of matching articles from
+the release-bundled [Nebula 3 Operator Help Knowledge Base](../src/nebula/v3/operator_help.md).
+An article is sent only when the message is about it: at least a seventh of the
+content words the operator wrote (not the context they selected) must name the
+article's topic (its title and keywords), so ordinary project conversation carries no
+help however many words it shares with a runbook, and a large selection does not hide
+a runbook question. When the operator's words ask about a problem ("why does this
+fail?", "what's wrong here?"), the selected lines that report a Nebula failure (a
+failure naming a Nebula surface such as the runner, Terminal, Core or a provider, or
+a Nebula error reference) count as what they wrote, up to five lines. The rest of a
+selection never does. Articles must also hold up against the best match: one that only shares
+product vocabulary with the question is left out, while each problem the question
+names by an article's keyword phrase keeps its runbook, up to three per request.
+This product corpus is separate from Project knowledge uploads: it is available even
+when a Project has no documents, contains no engagement data, and does not require a
+cloud-knowledge transfer confirmation. Product-help citations use stable
+`nebula-help:<article>` source IDs and a content-derived chunk ID.
+
+The corpus covers startup and diagnostics, runner and workstation setup, Terminal,
+automation runtime, policy/approval states, providers, reviewed execution, workspace limits,
+context compaction, migration/import/export, MCP servers, and the current release boundary.
+Matching articles travel with the operator's message in the model request, labeled as
+Nebula's own documentation rather than instructions. If no article matches an observed
+Nebula failure, the guidance sent with them tells the assistant to report the exact
+error and say that no verified recovery procedure is available instead of inventing a
+step. Command final synthesis also searches the observed failed result, so recovery
+guidance can match an error that was not known when the turn began. A failure receipt
+is searched by what it says (its category, problem, next action and error reference),
+not by the input schema it repeats for the model.
+
+Treat the bundled Markdown as release material: update implementation references and
+recovery steps in the same change as behavior, keep every command and UI label
+verifiable, and never add host-execution, policy-bypass, destructive-data, mutable
+image, example-digest, or guessed-log-path advice. The frozen-Core package audit
+requires the corpus so installed agents cannot silently lose it.
+
+## Interactive guides
+
+Choose **Guides** in the top bar, search the command palette for “guide”, or use
+**Show me how** beside a feature to open a walkthrough that takes you to the real
+control and highlights it. Steps confirm themselves from Core state, for example that
+a new hook appears in the project’s hook catalog, instead of trusting a click on Next.
+Guides that need files (lifecycle hooks, project skills, `AGENTS.md`) offer
+**Create starter files**, which writes new files into the Project workspace, never
+overwrites existing ones, and opens them in Code.
+
+Progress belongs to the active operator profile and is stored in Core, so a guide
+started on the desktop resumes at the same step on a paired phone. The guide
+definitions live in `ui/src/guides/catalog.ts`; each step names the `data-guide`
+control it highlights.
+
+## Workbench terminal, reviewed execution, and workspace limits
+
+### Integrated Project browser
+
+The desktop Workbench includes a multi-tab **Browser** backed by Tauri child
+webviews (WKWebView on macOS and WebKitGTK on Linux). Browser pages are remote,
+untrusted surfaces: they receive no Nebula IPC capability, Core token,
+filesystem bridge, opener permission, Project data, evidence, or model context.
+Navigation and pop-ups are limited to HTTP and HTTPS. Open tab URLs and history
+remain memory-only and are discarded when Nebula closes.
+
+Cookies, cache, and site storage use a separate persistent profile per Project
+on Linux and macOS 14 or newer. macOS 13 uses an isolated non-persistent store
+that is cleared when Nebula closes because that operating-system WebKit version
+does not provide named persistent stores. **Clear Project browser data** closes
+the Project's browser tabs and removes only that profile.
+
+Website downloads are staged in Nebula's private cache, subject to the native download staging limit, and streamed through the authenticated workspace
+upload endpoint. Core therefore applies the same atomic write, traversal, symlink, and overwrite-confirmation rules as an
+operator upload. A downloaded file enters Project Files only; it is never
+promoted to evidence or sent to a model without another explicit action.
+
+When a desktop session enables capture, Nebula automatically creates or reuses
+one Project-local interception CA and shows its SHA-256 fingerprint, expiry, and
+platform-specific trust instructions. The operator must explicitly trust that
+certificate in the operating system/browser; Nebula never installs it silently.
+The private key remains in protected native application data. Rotation and
+revocation close the Project's native browser tabs and stop its session proxies.
+
+The Hudsucker runtime is owned by the BrowserSession and shared by its tabs. It
+starts with no compiled Project scope, so missing, stale, malformed, or expired
+scope blocks requests locally and records a durable blocked event. It captures
+bounded redacted metadata/headers, HTTP/2 and WebSocket frames, and accepts only
+declarative run-owned rules for pass, block, redirect, delay, non-secret header
+changes, bounded body replacement, and WebSocket drop/replace. Rule errors,
+compressed-body mutation, oversized bodies, and out-of-scope redirects fail
+closed. Explicit body-artifact capture and upstream HTTP CONNECT/SOCKS5 chaining
+are available only when explicitly enabled: Core redacts bounded text/JSON/form/XML
+bodies before creating immutable artifacts, while binary, compressed, malformed,
+and oversized bodies remain metadata-only. Authenticated HTTP/HTTPS CONNECT and
+SOCKS5 chaining is supported through protected credential references, strict TLS
+validation, and URLs without embedded userinfo.
+
+The existing mission lifecycle can start a Project-scoped autonomous web test.
+Core persists a short-lived BrowserAutomationLease pinned to the current scope
+revision, identity, target subset, risk classes, credential references, and
+command/request/body budgets. `browser.*` and `proxy.*` tools enqueue durable
+idempotent commands; a desktop-only shell worker claims them for the paired
+session and returns bounded receipts. Mobile/LAN views may monitor and stop a
+run, but never claim native commands. Autonomous defaults are PASSIVE,
+ACTIVE_SCAN, and CREDENTIAL_USE. Exploitation, persistence, destructive actions,
+and scope changes require a separate durable step-up grant. There is no arbitrary
+JavaScript tool or cookie/storage/password/token read; credential use accepts a
+vault reference only and resolves it ephemerally for bounded fill actions.
+
+Nebula does not provide a host terminal. Workbench uses a human-operated
+**Terminal** in a verified human-workstation image containing the
+`kali-linux-headless` baseline. Core verifies the official base repository,
+platform, immutable digest, derived image ID, and versioned build-recipe labels,
+then persists the verified metadata locally. A fully verified cached base and
+workstation image are inspected before any pull or build, so cached launches
+make no registry request and remain usable offline.
+
+The release configuration seam `NEBULA_HUMAN_TERMINAL_SOURCE_IMAGE` accepts
+only a digest-pinned image in the official Kali repository. Source builds retain
+the official tagged development default. Publishing a prebuilt signed Nebula
+workstation image, its final digest, signature trust root, SBOM, provenance,
+licenses, and update policy remains a release gate; the repository does not
+invent or claim a digest before that external artifact exists.
+
+The Kali container runs as root with a writable disposable container layer and
+ordinary unrestricted outbound bridge networking. This deliberate human-only
+exception can reach the public Internet and host-addressable services. It does
+not receive host networking, added Linux capabilities, a host shell, or a
+container-runtime socket. Human-operated terminals may explicitly publish up to
+16 selected TCP or UDP port/protocol pairs on host loopback for that terminal
+session; the default remains no published ports. The runner itself must remain rootless or
+inside an approved desktop VM. Only the engagement workspace is mounted at
+`/workspace`; packages and system changes disappear when the session closes.
+The cached baseline supplies Kali's command-line default toolset and `ping`.
+Operators may install additional packages for that session with `apt`; the
+derived image config keeps APT usable despite the empty runtime capability set.
+Tools that require raw-packet or network-administration capabilities remain
+limited by design. The derived workstation removes Nmap's packaged file
+capabilities so it can start under the terminal's empty capability set and use
+its unprivileged connect-scan modes instead of failing during executable
+startup.
+
+Workbench presents active Project terminals as persistent browser-style tabs.
+Each tab owns an independent container, PTY, replay buffer, audit parser, and
+WebSocket while sharing only the Project's `/workspace`. Core admits at most 32
+pending or running human terminals globally. Tabs survive Workbench mode changes
+and short webview reconnects; bulk recovery restores all active tabs in creation
+order. A terminal stops on explicit **Stop**, confirmed tab close, Core shutdown,
+process exit, or a workspace-limit violation; inactivity alone does not stop it.
+A disconnected UI has a 10-minute reconnect grace. Core keeps at most 1 MiB of
+sequenced output per terminal for reconnect replay. Separately, mandatory shell
+framing records metadata for every completed command as a Project-lifetime audit.
+The derived image contains a verified,
+schema-versioned catalog of security executables from the installed Kali
+baseline. Image preparation resolves the installed direct dependencies of
+`kali-linux-headless`, removes Kali core plus the checked-in deployment/system
+package denylist, and inventories package-owned executables in standard `PATH`
+directories. Core reads that manifest back from the immutable image with
+networking disabled and persists its hash, image digest, package provenance, and
+sorted tool list; a missing or unsafe manifest rejects terminal preparation.
+Workbench Activity lets each Project add custom executable names or
+deselect image defaults. If an executed simple command matches the snapshotted
+Project selection, the top-level command's merged PTY result is stored as raw and
+redacted content-addressed artifacts; otherwise provisional result bytes are
+discarded. Each record includes the capture decision, matched tools, policy
+revision, image digest, operator, session, directory, timing, status, and exit
+code. Selected capture is capped at 10 MiB while the full observed stream is
+still counted and hashed. Classification uncertainty fails closed to metadata
+only. Interrupted, truncated, recovered, framing-loss, classification, and
+persistence-gap conditions remain visible in audit health. Existing records and
+artifacts remain unchanged and are labeled as legacy full-output or metadata-only.
+
+Authenticated clients read the catalog and Project overlay from
+`GET /api/v1/engagements/{id}/terminal/recording-tools` and replace the overlay
+with `PUT` using the displayed manifest digest and policy revision. A stale image
+catalog or revision returns `409`; executable names containing paths, whitespace,
+control characters, or shell syntax are rejected. The existing history status
+update and delete routes remain immutable `409` responses.
+
+Command metadata cannot be disabled or cleared independently of Project deletion
+and is included in sensitive bundle v3 exports. Tool selection controls only
+future result retention and never deletes historical artifacts. Raw result
+downloads require a sensitive-data acknowledgement. Inline secrets and selected
+tool output may therefore enter raw audit artifacts, while interactive password
+responses are not recorded as shell commands. Terminal commands and results are
+not sent to an AI provider or promoted to evidence without an explicit operator
+action. Highlight terminal text and press Ctrl+C on Linux or Windows, or
+Command+C on macOS, to copy it;
+with no selection, Ctrl+C remains a terminal interrupt. Because an operator
+controls an unrestricted root shell, the audit supplies durable attribution and
+integrity checking rather than protection from a deliberately malicious root
+operator.
+
+A supported completed assistant fence (`bash`/`shell`, `sh`, or
+`python`/`python3`/`py`) can also be copied or sent through an exact one-shot
+review. Every run starts a new non-root container with fixed v1 limits:
+1 CPU, 512 MiB RAM, 128 PIDs, 300 seconds, and independent 2,000,000-byte stdout
+and stderr capture limits. The program has no interactive stdin. Only the
+engagement workspace is mounted at `/workspace`; containers are never resumed.
+
+Reviewed code execution uses unrestricted outbound bridge networking in a fresh
+non-root container after exact-source review and Core preflight. It has no host
+shell fallback, interactive stdin, or container-runtime socket exposed to the
+webview. Agent commands use the Project's selected Docker or Host mode; Docker
+sessions start offline and activate the frozen Project network scope only under
+the Project approval policy. See [Automation runtime](AUTOMATION-RUNTIME.md).
+
+Project workspaces have no application-imposed total-size, entry-count or
+individual-file quota. Terminal readiness and uploads do not recursively scan
+folders for quota accounting, and execution has no periodic quota monitor.
+Browser uploads use streamed atomic writes
+with traversal and symlink protection. Promotion copies and verifies exact
+bytes into immutable artifacts, while reset never follows symlinks and never
+removes promoted evidence.
+
+## Automation safety model
+
+Command execution uses two fixed tools, `run_command` and `process_io`, backed by one prepared Kali container per agent session. Programs are ordinary binaries on `PATH`; there is no installation, publishing, assignment, or per-program adapter layer. In Docker mode the container runs as a non-root user with a read-only root filesystem, dropped capabilities, and CPU, memory, and process limits, mounts only the Project workspace, and never falls back to the host. Host mode, which runs commands directly on the Nebula host, applies only after the operator explicitly acknowledges host filesystem and network access for that Project. See [Automation runtime](AUTOMATION-RUNTIME.md).
+
+A provider chat turn can receive further tools only from what the operator selects for that turn: `tool_output.*` and `workspace.*` retrieval alongside commands; `mcp.*` tools from the selected MCP servers; browser tools for an attached browser session; application-model tools when that context is attached; `skill.read_resource` for resources referenced by selected skills; when subagents are allowed, `start_subagent`, `wait_subagents`, `list_subagents`, `message_subagent`, and `stop_subagent` (subagents cannot start further subagents; every subagent turn gets `message_parent` and `read_parent_messages`); and, when main-agent messaging is enabled, `list_agents`, `send_agent_message`, and `read_agent_messages` for opted-in main conversations in the same project. Every tool turn requires an engagement-scoped session and a model verified for tool use, and cloud providers additionally require a privacy profile that permits tool-result transfer plus per-turn confirmation. Core executes every call, and commands and MCP tools pause for approval according to the Project approval setting and each MCP server's approval mode.
+
+The complete Project network boundary is installed at session creation but starts disabled. A `project_scope` request activates CIDR, domain, wildcard-domain, and TCP-port policy according to the Project approval setting. The policy DNS resolver blocks alternate DNS, direct bypasses, unauthorized private destinations, and rebinding responses. URL-path-only entries fail closed for arbitrary shell access.
+
+Command stdout and stderr are immutable artifacts. Models receive compact redacted receipts and bounded retrieval capabilities. Selected MCP profiles remain separate and are frozen into durable session or run state. Human Terminal and reviewed code execution keep their distinct human-confirmed boundaries.
+
+## Operator-workflow release verification
+
+CI runs a reviewed selection of affected Python, frontend, native, and browser
+journeys. The release workflow adds sandbox integration, packaging contracts,
+native compile checks, and package install/smoke gates without rerunning the full
+product suites. See [Focused test policy](TEST_SELECTION.md) and the
+[release runbook](../packaging/RELEASING.md).
+
+Before a release, manually smoke-test the prepared Kali agent runtime and the
+official Kali terminal on Docker Desktop or a rootless Podman Machine. Confirm
+Kali pull/digest resolution, root and writable ephemeral state, outbound bridge
+connectivity, no added capabilities or published ports, terminal
+disconnect/Core-restart cleanup, an offline Docker command, a Project-scoped
+Docker command, an acknowledged Host-mode command,
+cancellation cleanup, Core-restart interruption, workspace promotion/reset,
+terminal catalog validation, harmless `nmap --version` selected recording beside
+an unselected shell command with no artifacts, recovery/truncation warnings,
+acknowledged raw-output download,
+Draft note/Discuss in chat, cached PDF export, and sensitive bundle v3 export.
+The release is blocked if reviewed execution runs without exact-source review,
+agent command execution bypasses its Project mode or approval policy, a runtime
+socket or host terminal reaches the webview, or any Docker runner failure falls
+back to host execution.
+
+## Current release boundary
+
+The native desktop is the canonical user path. Scanner import, topology,
+comparison, full-desktop capture, a manager for intentionally detached or hidden
+terminal containers, rich HTML notes,
+legacy Chroma command search, and always-on AI suggestions remain deliberately
+out of the initial parity release. PostgreSQL team authorization, OIDC/RBAC,
+remote workers, A2A, signed third-party plugins, and advanced specialist
+environments remain separate projects.

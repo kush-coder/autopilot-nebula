@@ -1,0 +1,186 @@
+import { invoke } from "@tauri-apps/api/core";
+import { configureBrowserDiagnostics, logDiagnostic } from "../diagnostics";
+import { electronDesktop } from "./electronDesktop";
+
+export interface ApiRuntime {
+  baseUrl?: string;
+  token?: string;
+  mode: "browser" | "desktop" | "desktop_remote";
+  state: "ready" | "unavailable";
+  message?: string;
+  reason?: "browser_session_token_missing";
+}
+
+interface BackendSession {
+  endpoint: string;
+  token: string;
+  protocol: "nebula-sidecar-v1" | "nebula-remote-core-v1";
+  source?: "local" | "remote";
+}
+
+export function browserSessionRequiresRelaunch(
+  token: string | undefined,
+  development: boolean,
+): boolean {
+  return !token && !development;
+}
+
+export function browserAuthorizationRecovery(hostname: string): "pair" | "relaunch" {
+  const normalized = hostname.toLocaleLowerCase().replace(/^\[|\]$/g, "");
+  return normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized)
+    ? "relaunch"
+    : "pair";
+}
+
+export async function browserSessionAuthorizationStatus(normalizedBase: string): Promise<"authorized" | "unauthorized" | "unreachable"> {
+  const healthUrl = normalizedBase.endsWith("/api/v1")
+    ? `${normalizedBase}/health`
+    : `${normalizedBase}/api/v1/health`;
+  try {
+    const response = await fetch(healthUrl, {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+    if (response.ok) return "authorized";
+    return response.status === 401 || response.status === 403 ? "unauthorized" : "unreachable";
+  } catch {
+    // diagnostic-expected: an unreachable Core has an in-place retry state; keep pairing intact.
+    return "unreachable";
+  }
+}
+
+let browserRuntimeToken: string | undefined;
+let desktopDeviceIdentity: string | undefined;
+
+export async function desktopDeviceId(): Promise<string> {
+  if (isElectronRuntime()) return electronDesktop()!.deviceId();
+  if (!isTauriRuntime()) return "paired-browser";
+  if (desktopDeviceIdentity) return desktopDeviceIdentity;
+  desktopDeviceIdentity = await invoke<string>("desktop_device_id");
+  return desktopDeviceIdentity;
+}
+
+export async function unlockProviderCredential(reference: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("Unlock the credential vault on the Nebula Core host, then retry.");
+  }
+  await invoke("unlock_provider_credential", { reference });
+}
+
+function consumeBrowserFragmentToken(): string | undefined {
+  if (typeof window === "undefined") return browserRuntimeToken;
+  const fragment = window.location.hash.replace(/^#/, "");
+  if (!fragment) return browserRuntimeToken;
+
+  const parameters = new URLSearchParams(fragment);
+  const suppliedToken = parameters.get("token")?.trim();
+  if (!suppliedToken) return browserRuntimeToken;
+
+  browserRuntimeToken = suppliedToken;
+  parameters.delete("token");
+  const remainingFragment = parameters.toString();
+  const cleanUrl = `${window.location.pathname}${window.location.search}${remainingFragment ? `#${remainingFragment}` : ""}`;
+  window.history.replaceState(window.history.state, "", cleanUrl);
+  return browserRuntimeToken;
+}
+
+export function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export function isElectronRuntime(): boolean {
+  return electronDesktop()?.kind === "electron";
+}
+
+export async function resolveApiRuntime(): Promise<ApiRuntime> {
+  if (isElectronRuntime()) {
+    try {
+      const session = await electronDesktop()!.resolveBackendConnection();
+      return { baseUrl: session.endpoint, token: session.token, mode: "desktop", state: "ready" };
+    } catch (error) {
+      void logDiagnostic({
+        level: "error",
+        eventCode: "interface.runtime.electron_unavailable",
+        message: "The Electron interface could not connect to its supervised Core.",
+        outcome: "failure",
+        stage: "runtime-resolution",
+        retryable: true,
+        safeFailureCause: "The local Core did not become ready.",
+        exception: error,
+      });
+      return { mode: "desktop", state: "unavailable",
+        message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  if (isTauriRuntime()) {
+    try {
+      const session = await invoke<BackendSession>("resolve_backend_connection");
+      const remote = session.source === "remote";
+      void logDiagnostic({
+        level: "info",
+        eventCode: "interface.runtime.desktop_ready",
+        message: remote ? "The interface connected to the configured remote Core." : "The interface connected to the supervised local Core.",
+        outcome: "success",
+        stage: "runtime-resolution",
+      });
+      return {
+        baseUrl: session.endpoint,
+        token: session.token,
+        mode: remote ? "desktop_remote" : "desktop",
+        state: "ready",
+      };
+    } catch (error) {
+      void logDiagnostic({
+        level: "error",
+        eventCode: "interface.runtime.desktop_unavailable",
+        message: "The interface could not connect to the selected Core.",
+        outcome: "failure",
+        stage: "runtime-resolution",
+        retryable: true,
+        safeFailureCause: "The local Core did not become ready.",
+        exception: error,
+      });
+      return {
+        mode: "desktop",
+        state: "unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  const baseUrl = import.meta.env.VITE_NEBULA_API_URL;
+  const token = consumeBrowserFragmentToken() ?? import.meta.env.VITE_NEBULA_API_TOKEN;
+  const normalizedBase = (baseUrl?.trim() || globalThis.location?.origin || "http://127.0.0.1")
+    .replace(/\/+$/, "");
+  if (browserSessionRequiresRelaunch(token, import.meta.env.DEV)) {
+    const authorization = await browserSessionAuthorizationStatus(normalizedBase);
+    if (authorization !== "authorized") {
+      return {
+        baseUrl,
+        mode: "browser",
+        state: "unavailable",
+        reason: authorization === "unauthorized" ? "browser_session_token_missing" : undefined,
+        message: authorization === "unauthorized"
+          ? "This browser session no longer has access to Core."
+          : "Nebula Core could not be reached. Check the server connection and retry.",
+      };
+    }
+  }
+  configureBrowserDiagnostics(
+    normalizedBase.endsWith("/api/v1") ? normalizedBase : `${normalizedBase}/api/v1`,
+    token,
+  );
+  void logDiagnostic({
+    level: "info",
+    eventCode: "interface.runtime.browser_ready",
+    message: "The browser-development API runtime was resolved.",
+    outcome: "success",
+    stage: "runtime-resolution",
+  });
+  return {
+    baseUrl,
+    token,
+    mode: "browser",
+    state: "ready",
+  };
+}

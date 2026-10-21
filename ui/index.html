@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en" data-theme="quiet-lens">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#090d11" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/nebula-icon.svg" />
+    <link rel="apple-touch-icon" href="/nebula-icon-180.png" />
+    <meta
+      name="description"
+      content="Nebula 3 local-first security engagement workspace"
+    />
+    <title>Nebula 3</title>
+    <!-- Critical launch visuals stay inline so they paint before the application bundle. -->
+    <style>
+      :root[data-theme="quiet-lens"] {
+        background: #090d11;
+        color-scheme: dark;
+      }
+
+      :root[data-theme="quiet-lens"] body {
+        margin: 0;
+        background: #090d11;
+      }
+
+      #nebula-boot {
+        position: fixed;
+        z-index: 2147483647;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at center, #142128 0%, #090d11 45%, #090d11 100%);
+        opacity: 1;
+        transition: opacity 160ms ease, visibility 160ms;
+      }
+
+      #nebula-boot.nebula-boot--leaving {
+        visibility: hidden;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      .nebula-boot__mark {
+        display: block;
+        width: 70px;
+        height: 112px;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #nebula-boot { transition: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>Nebula requires JavaScript to render the engagement workspace.</noscript>
+    <div id="nebula-boot" role="status" aria-live="polite" aria-label="Nebula is starting">
+      <img class="nebula-boot__mark" src="/nebula-logo.svg" width="70" height="112" alt="" aria-hidden="true" />
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

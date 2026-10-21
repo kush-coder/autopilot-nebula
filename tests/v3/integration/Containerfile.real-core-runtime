@@ -1,0 +1,20 @@
+# The browser acceptance test needs a real container-backed Core, but it does
+# not need to reinstall the multi-gigabyte kali-linux-headless workstation on
+# every clean CI runner. This fixture preserves the production preparer's
+# official-base, digest, label, helper, and inventory verification contract.
+ARG KALI_SOURCE=docker.io/kalilinux/kali-rolling:latest
+FROM ${KALI_SOURCE}
+
+ARG KALI_SOURCE
+COPY src/nebula/v3/egress_helper.py /usr/local/bin/nebula-egress
+COPY tests/v3/integration/real-core-security-tools.json /usr/local/share/nebula/security-tools.json
+RUN apt-get update \
+ && apt-get install -y python3 python3-debugpy \
+ && chmod 0500 /usr/local/bin/nebula-egress \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+LABEL org.nebula.human-terminal.base="${KALI_SOURCE}"
+LABEL org.nebula.human-terminal.profile="kali-linux-headless"
+LABEL org.nebula.human-terminal.recipe="v5"
+CMD ["/bin/bash"]
